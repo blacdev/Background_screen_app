@@ -21,6 +21,7 @@ App test:
 - Bind configured `browser` screens to the existing LAN browser receiver path.
 - Separate discovered browser clients from user-configured browser screens.
 - Route browser-targeted quick play and schedules through configured screen ids.
+- Enforce one connected browser receiver per configured browser screen binding.
 
 App test:
 - Configure a browser screen

@@ -63,6 +63,14 @@ from PySide6.QtWidgets import (
 )
 from shiboken6 import isValid
 
+from browser_screen_bindings import (
+    BROWSER_BINDING_KEY,
+    browser_binding_remote_id,
+    browser_target_status_detail,
+    configured_browser_screen_ids,
+    resolve_browser_commands,
+    validate_unique_browser_bindings,
+)
 from screen_protocols import (
     CAPABILITY_LABELS,
     SCREEN_CAPABILITIES,
@@ -966,6 +974,10 @@ def configured_screen_summary(screen: ConfiguredScreen) -> str:
     capability_labels = [CAPABILITY_LABELS.get(item, item) for item in screen.capabilities]
     capability_text = ", ".join(capability_labels) if capability_labels else "No capabilities"
     return f"{TRANSPORT_LABELS.get(screen.transport, screen.transport)} • {capability_text}"
+
+
+def configured_screen_name_map(configured_screens: list[ConfiguredScreen]) -> dict[str, str]:
+    return {screen.id: screen.name for screen in configured_screens if screen.name.strip()}
 
 
 class LanRemoteServer:
@@ -2245,6 +2257,7 @@ class PlaybackCoordinator(QWidget):
         self.current_entry_id: str | None = None
         self.quick_play_paths: dict[str, Path] = {}
         self.quick_play_labels: dict[str, str] = {}
+        self.virtual_screen_ids: set[str] = set()
         self.command_version = 0
         self.screen_commands: dict[str, dict[str, Any]] = {}
         self.last_assignment_keys: dict[str, str] = {}
@@ -2275,6 +2288,10 @@ class PlaybackCoordinator(QWidget):
             if not self.is_window_usable(screen_id, window):
                 continue
             window.set_transition_method(self.transition_method)
+
+    def set_virtual_screen_ids(self, screen_ids: set[str]) -> None:
+        self.virtual_screen_ids = set(screen_ids)
+        self.sync_current_entry(force=True)
 
     def launch_windows(self) -> None:
         self.playback_enabled = True
@@ -2343,7 +2360,13 @@ class PlaybackCoordinator(QWidget):
         for screen_id in targets:
             self.quick_play_paths.pop(screen_id, None)
             self.quick_play_labels.pop(screen_id, None)
-            if self.manage_local_windows and not is_remote_screen_id(screen_id) and screen_id not in self.selected_monitor_ids and screen_id in self.windows:
+            if (
+                self.manage_local_windows
+                and screen_id not in self.virtual_screen_ids
+                and not is_remote_screen_id(screen_id)
+                and screen_id not in self.selected_monitor_ids
+                and screen_id in self.windows
+            ):
                 window = self.windows.pop(screen_id)
                 if isValid(window):
                     window.close()
@@ -2357,7 +2380,7 @@ class PlaybackCoordinator(QWidget):
             screen_id
             for entry in self.schedules
             for screen_id in entry.screen_ids
-            if is_remote_screen_id(screen_id)
+            if is_remote_screen_id(screen_id) or screen_id in self.virtual_screen_ids
         }
         return sorted(set(self.selected_monitor_ids) | set(self.quick_play_paths.keys()) | schedule_remote_targets)
 
@@ -2465,11 +2488,11 @@ class PlaybackCoordinator(QWidget):
                     continue
                 assignment = assignments.get(screen_id)
                 if assignment is None:
-                    if not is_remote_screen_id(screen_id):
+                    if not is_remote_screen_id(screen_id) and screen_id not in self.virtual_screen_ids:
                         self.windows.pop(screen_id, None)
                         if isValid(window):
                             window.close()
-                    continue
+                        continue
                 if assignment.get("type") == "play" and assignment.get("mode") == "quick_play":
                     override_path = assignment.get("path")
                     if isinstance(override_path, Path):
@@ -2490,7 +2513,7 @@ class PlaybackCoordinator(QWidget):
                         play_at_ms=play_at_ms,
                     )
                 else:
-                    if screen_id not in self.selected_monitor_ids and not is_remote_screen_id(screen_id):
+                    if screen_id not in self.selected_monitor_ids and not is_remote_screen_id(screen_id) and screen_id not in self.virtual_screen_ids:
                         self.windows.pop(screen_id, None)
                         if isValid(window):
                             window.close()
@@ -3021,9 +3044,15 @@ class QuickPlayTargetDialog(QDialog):
 
 
 class ConfiguredScreenEditorDialog(QDialog):
-    def __init__(self, screen: ConfiguredScreen | None = None, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        screen: ConfiguredScreen | None = None,
+        remote_screens: dict[str, dict[str, Any]] | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self.screen = screen
+        self.remote_screens = {str(key): dict(value) for key, value in (remote_screens or {}).items()}
         self.setWindowTitle("Configured Screen")
         self.setModal(True)
         self.resize(520, 420)
@@ -3055,6 +3084,10 @@ class ConfiguredScreenEditorDialog(QDialog):
         form.addRow("Binding", self.binding_edit)
         layout.addLayout(form)
 
+        self.browser_binding_selector = QComboBox(self)
+        self.browser_binding_selector.currentIndexChanged.connect(self.on_browser_binding_changed)
+        layout.addWidget(self.browser_binding_selector)
+
         capability_title = QLabel("Capabilities")
         capability_title.setObjectName("sectionDescription")
         layout.addWidget(capability_title)
@@ -3081,7 +3114,7 @@ class ConfiguredScreenEditorDialog(QDialog):
 
         if screen is not None:
             self.name_edit.setText(screen.name)
-            self.binding_edit.setText(screen.binding.get("value", ""))
+            self.binding_edit.setText(browser_binding_remote_id(screen) or screen.binding.get("value", ""))
             selected_index = self.transport_selector.findData(screen.transport)
             if selected_index >= 0:
                 self.transport_selector.setCurrentIndex(selected_index)
@@ -3096,13 +3129,39 @@ class ConfiguredScreenEditorDialog(QDialog):
     def on_transport_changed(self) -> None:
         transport = str(self.transport_selector.currentData() or "")
         supported = set(supported_capabilities(transport))
+        should_seed_defaults = self.screen is None and not any(item.isChecked() for item in self.capability_checks.values())
         for capability, checkbox in self.capability_checks.items():
             allowed = capability in supported
             checkbox.setEnabled(allowed)
             if not allowed:
                 checkbox.setChecked(False)
-            elif self.screen is None and not any(item.isChecked() for item in self.capability_checks.values()):
+            elif should_seed_defaults:
                 checkbox.setChecked(True)
+        self.refresh_browser_binding_selector()
+
+    def refresh_browser_binding_selector(self) -> None:
+        is_browser = str(self.transport_selector.currentData() or "") == "browser"
+        self.browser_binding_selector.setVisible(is_browser)
+        if not is_browser:
+            return
+        self.browser_binding_selector.blockSignals(True)
+        self.browser_binding_selector.clear()
+        self.browser_binding_selector.addItem("Bind manually or choose a connected browser receiver", "")
+        for screen_id, state in sorted(self.remote_screens.items(), key=lambda item: friendly_remote_name(item[0], {}, item[1]).lower()):
+            online_text = "online" if state.get("online") else "offline"
+            label = f"{friendly_remote_name(screen_id, {}, state)} ({online_text})"
+            self.browser_binding_selector.addItem(label, screen_id)
+        current_binding = self.binding_edit.text().strip()
+        if current_binding:
+            index = self.browser_binding_selector.findData(current_binding)
+            if index >= 0:
+                self.browser_binding_selector.setCurrentIndex(index)
+        self.browser_binding_selector.blockSignals(False)
+
+    def on_browser_binding_changed(self) -> None:
+        remote_id = str(self.browser_binding_selector.currentData() or "")
+        if remote_id:
+            self.binding_edit.setText(remote_id)
 
     def selected_capabilities(self) -> list[str]:
         return [capability for capability, checkbox in self.capability_checks.items() if checkbox.isChecked()]
@@ -3114,7 +3173,7 @@ class ConfiguredScreenEditorDialog(QDialog):
             name=self.name_edit.text().strip(),
             transport=str(self.transport_selector.currentData() or ""),
             capabilities=self.selected_capabilities(),
-            binding={"value": binding_value} if binding_value else {},
+            binding={BROWSER_BINDING_KEY: binding_value} if binding_value else {},
         )
         screen.validate()
         return screen
@@ -3131,9 +3190,15 @@ class ConfiguredScreenEditorDialog(QDialog):
 
 
 class ConfiguredScreenManagerDialog(QDialog):
-    def __init__(self, screens: list[ConfiguredScreen], parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        screens: list[ConfiguredScreen],
+        remote_screens: dict[str, dict[str, Any]] | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self._screens = [ConfiguredScreen.from_dict(screen.to_dict()) for screen in screens]
+        self.remote_screens = {str(key): dict(value) for key, value in (remote_screens or {}).items()}
         self.setWindowTitle("Configured Screens")
         self.setModal(True)
         self.resize(720, 440)
@@ -3190,7 +3255,7 @@ class ConfiguredScreenManagerDialog(QDialog):
         return self.screen_list.currentRow()
 
     def add_screen(self) -> None:
-        dialog = ConfiguredScreenEditorDialog(parent=self)
+        dialog = ConfiguredScreenEditorDialog(remote_screens=self.remote_screens, parent=self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self._screens.append(dialog.build_screen())
@@ -3200,7 +3265,7 @@ class ConfiguredScreenManagerDialog(QDialog):
         index = self.selected_index()
         if index < 0 or index >= len(self._screens):
             return
-        dialog = ConfiguredScreenEditorDialog(self._screens[index], self)
+        dialog = ConfiguredScreenEditorDialog(self._screens[index], self.remote_screens, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self._screens[index] = dialog.build_screen()
@@ -3321,12 +3386,17 @@ class MainWindow(QMainWindow):
         ensure_app_paths()
         config = load_config()
         self.configured_screens = [ConfiguredScreen.from_dict(item.to_dict()) for item in config["configured_screens"]]
+        try:
+            validate_unique_browser_bindings(self.configured_screens)
+        except ValueError:
+            self.configured_screens = []
         self.schedules = [ScheduleEntry.from_dict(item) for item in config["schedules"]]
         self.selected_monitor_ids = [str(item) for item in config["selected_monitor_ids"]]
         self.video_directory: Path | None = Path(config["video_directory"]).expanduser() if config["video_directory"] else None
         if self.video_directory is not None and not self.video_directory.exists():
             self.video_directory = None
         self.screen_aliases: dict[str, str] = {str(key): str(value) for key, value in config["screen_aliases"].items()}
+        self.screen_aliases.update(configured_screen_name_map(self.configured_screens))
         self.transition_method = str(config["transition_method"])
         self.run_at_startup = bool(config["run_at_startup"])
         self.available_videos: list[Path] = []
@@ -4219,7 +4289,7 @@ class MainWindow(QMainWindow):
             self.set_form_message("Background engine was not running or could not be stopped.", "error")
 
     def manage_configured_screens(self, checked: bool = False) -> None:
-        dialog = ConfiguredScreenManagerDialog(self.configured_screens, self)
+        dialog = ConfiguredScreenManagerDialog(self.configured_screens, self.remote_screens, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         updated_screens = dialog.configured_screens()
@@ -4317,25 +4387,14 @@ class MainWindow(QMainWindow):
                     detail=f"HDMI / local display • {geometry.width()}x{geometry.height()}",
                 )
             )
-        for screen_id, state in sorted(self.remote_screens.items(), key=lambda item: friendly_remote_name(item[0], self.screen_aliases, item[1]).lower()):
-            online = bool(state.get("online"))
+        for screen in sorted((item for item in self.configured_screens if item.transport == "browser"), key=lambda item: item.name.lower()):
+            online, detail, warning = browser_target_status_detail(screen, self.remote_screens)
             if not include_offline and not online:
                 continue
-            name = friendly_remote_name(screen_id, self.screen_aliases, state)
-            size_text = ""
-            if int(state.get("width") or 0) and int(state.get("height") or 0):
-                size_text = f" • {int(state.get('width') or 0)}x{int(state.get('height') or 0)}"
-            detail = f"LAN screen • {'Online' if online else 'Offline'}"
-            if state.get("ip"):
-                detail += f" • {state['ip']}"
-            detail += size_text
-            warning = ""
-            if not online:
-                warning = "This LAN screen has disconnected."
             targets.append(
                 UnifiedScreenTarget(
-                    id=screen_id,
-                    label=name,
+                    id=screen.id,
+                    label=screen.name,
                     kind="remote",
                     online=online,
                     detail=detail,
@@ -4435,7 +4494,7 @@ class MainWindow(QMainWindow):
                     geometry = local_screen.geometry()
                     label = f"{target.label} ({geometry.width()}x{geometry.height()})"
             else:
-                label = f"{target.label} (LAN{' • offline' if not target.online else ''})"
+                label = f"{target.label} (Browser{' • offline' if not target.online else ''})"
             action = self.screen_target_menu.addAction(label)
             action.setCheckable(True)
             action.setChecked(target.id in self.selected_monitor_ids)
@@ -4448,10 +4507,15 @@ class MainWindow(QMainWindow):
             schedule_action.setChecked(target.id in self.current_form_screen_ids)
             schedule_action.setToolTip(target.warning or target.detail)
             schedule_action.triggered.connect(lambda checked=False, screen_id=target.id: self.toggle_schedule_screen_selection(screen_id))
-            if target.kind == "remote":
-                remote_action = self.remote_screens_menu.addAction(label)
-                remote_action.setEnabled(False)
-                remote_action.setToolTip(target.warning or target.detail)
+        for screen_id, state in sorted(self.remote_screens.items(), key=lambda item: friendly_remote_name(item[0], self.screen_aliases, item[1]).lower()):
+            remote_label = friendly_remote_name(screen_id, self.screen_aliases, state)
+            suffix = "online" if state.get("online") else "offline"
+            remote_action = self.remote_screens_menu.addAction(f"{remote_label} ({suffix})")
+            remote_action.setEnabled(False)
+            detail = str(state.get("ip") or "")
+            if int(state.get("width") or 0) and int(state.get("height") or 0):
+                detail = f"{detail} • {int(state.get('width') or 0)}x{int(state.get('height') or 0)}".strip(" •")
+            remote_action.setToolTip(detail or screen_id)
         self.update_monitor_summary()
         self.update_schedule_screen_summary()
         self.refresh_schedule_list()
@@ -4816,6 +4880,7 @@ class MainWindow(QMainWindow):
         if self.video_directory is not None and not self.video_directory.exists():
             self.video_directory = None
         self.screen_aliases = {str(key): str(value) for key, value in (snapshot.get("screenAliases") or {}).items()}
+        self.screen_aliases.update(configured_screen_name_map(self.configured_screens))
         self.transition_method = str(snapshot.get("transitionMethod") or "fade_black")
         self.run_at_startup = bool(snapshot.get("runAtStartup"))
         available_media = snapshot.get("availableMedia") or []
@@ -5552,12 +5617,17 @@ class ControllerEngine(QObject):
         self.media_scan_error = ""
         config = load_config()
         self.configured_screens = [ConfiguredScreen.from_dict(item.to_dict()) for item in config["configured_screens"]]
+        try:
+            validate_unique_browser_bindings(self.configured_screens)
+        except ValueError:
+            self.configured_screens = []
         self.schedules = [ScheduleEntry.from_dict(item) for item in config["schedules"]]
         self.selected_monitor_ids = [str(item) for item in config["selected_monitor_ids"]]
         self.video_directory: Path | None = Path(config["video_directory"]).expanduser() if config["video_directory"] else None
         if self.video_directory is not None and not self.video_directory.exists():
             self.video_directory = None
         self.screen_aliases = {str(key): str(value) for key, value in config["screen_aliases"].items()}
+        self.screen_aliases.update(configured_screen_name_map(self.configured_screens))
         self.transition_method = str(config["transition_method"])
         self.run_at_startup = bool(config["run_at_startup"])
         self.available_videos: list[Path] = []
@@ -5588,6 +5658,7 @@ class ControllerEngine(QObject):
         self.coordinator.commands_changed.connect(self.sync_playback_outputs)
         self.coordinator.set_schedules(self.schedules)
         self.coordinator.set_selected_monitors(self.selected_monitor_ids)
+        self.coordinator.set_virtual_screen_ids(self.browser_configured_screen_ids())
         self.coordinator.set_video_directory(self.video_directory)
         self.coordinator.set_transition_method(self.transition_method)
         self.remote_server = LanRemoteServer()
@@ -5608,6 +5679,12 @@ class ControllerEngine(QObject):
     def on_status_changed(self, clock_label: str, active_label: str) -> None:
         self.status_clock_label = clock_label
         self.status_active_label = active_label
+
+    def browser_configured_screens(self) -> list[ConfiguredScreen]:
+        return [screen for screen in self.configured_screens if screen.transport == "browser"]
+
+    def browser_configured_screen_ids(self) -> set[str]:
+        return configured_browser_screen_ids(self.configured_screens)
 
     def on_playback_state_changed(self, paused: bool, window_count: int) -> None:
         self.playback_paused = paused
@@ -5812,18 +5889,14 @@ class ControllerEngine(QObject):
                     detail=f"HDMI / local display • {geometry.width()}x{geometry.height()}",
                 )
             )
-        for screen_id, state in sorted(self.remote_screens.items(), key=lambda item: friendly_remote_name(item[0], self.screen_aliases, item[1]).lower()):
-            online = bool(state.get("online"))
+        for screen in sorted(self.browser_configured_screens(), key=lambda item: item.name.lower()):
+            online, detail, warning = browser_target_status_detail(screen, self.remote_screens)
             if not include_offline and not online:
                 continue
-            detail = f"LAN screen • {'Online' if online else 'Offline'}"
-            if state.get("ip"):
-                detail += f" • {state['ip']}"
-            warning = "" if online else "This LAN screen has disconnected."
             targets.append(
                 UnifiedScreenTarget(
-                    id=screen_id,
-                    label=friendly_remote_name(screen_id, self.screen_aliases, state),
+                    id=screen.id,
+                    label=screen.name,
                     kind="remote",
                     online=online,
                     detail=detail,
@@ -5834,7 +5907,11 @@ class ControllerEngine(QObject):
 
     def build_remote_server_commands(self) -> dict[str, dict[str, Any]]:
         commands: dict[str, dict[str, Any]] = {}
-        for screen_id, command in self.coordinator.command_snapshots().items():
+        command_snapshots = self.coordinator.command_snapshots()
+        commands.update(resolve_browser_commands(self.configured_screens, self.remote_screens, command_snapshots))
+        for screen_id, command in command_snapshots.items():
+            if screen_id in self.browser_configured_screen_ids():
+                continue
             media_path = Path(str(command.get("path") or "")) if command.get("path") else None
             media_url = ""
             if media_path is not None:
@@ -5869,7 +5946,7 @@ class ControllerEngine(QObject):
         return sorted(
             screen_id
             for screen_id in self.coordinator.all_active_screen_ids()
-            if not is_remote_screen_id(screen_id)
+            if not is_remote_screen_id(screen_id) and screen_id not in self.browser_configured_screen_ids()
         )
 
     def spawn_local_playback_worker(self, screen_id: str) -> None:
@@ -6083,6 +6160,9 @@ class ControllerEngine(QObject):
             self.persist_state()
         elif action == "set_configured_screens":
             self.configured_screens = validate_configured_screens(payload.get("configured_screens"))
+            validate_unique_browser_bindings(self.configured_screens)
+            self.screen_aliases.update(configured_screen_name_map(self.configured_screens))
+            self.coordinator.set_virtual_screen_ids(self.browser_configured_screen_ids())
             self.persist_state()
         elif action == "save_schedule":
             raw_schedule = payload.get("schedule")
