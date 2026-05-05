@@ -63,6 +63,17 @@ from PySide6.QtWidgets import (
 )
 from shiboken6 import isValid
 
+from screen_protocols import (
+    CAPABILITY_LABELS,
+    SCREEN_CAPABILITIES,
+    SCREEN_TRANSPORTS,
+    TRANSPORT_LABELS,
+    ConfiguredScreen,
+    parse_configured_screens,
+    supported_capabilities,
+    validate_configured_screens,
+)
+
 
 # Long-running local playback has been more stable when Qt is allowed to use
 # its normal Windows video pipeline. We keep a switch to force software
@@ -331,6 +342,7 @@ def load_config() -> dict[str, Any]:
     ensure_app_paths()
     if not CONFIG_PATH.exists():
         return {
+            "configured_screens": [],
             "selected_monitor_ids": [],
             "video_directory": "",
             "screen_aliases": {},
@@ -343,6 +355,7 @@ def load_config() -> dict[str, Any]:
         data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return {
+            "configured_screens": [],
             "selected_monitor_ids": [],
             "video_directory": "",
             "screen_aliases": {},
@@ -352,12 +365,14 @@ def load_config() -> dict[str, Any]:
         }
 
     selected = data.get("selected_monitor_ids")
+    configured_screens = parse_configured_screens(data.get("configured_screens"))
     schedules = data.get("schedules")
     video_directory = data.get("video_directory")
     screen_aliases = data.get("screen_aliases")
     transition_method = data.get("transition_method")
     run_at_startup = data.get("run_at_startup")
     return {
+        "configured_screens": configured_screens,
         "selected_monitor_ids": selected if isinstance(selected, list) else [],
         "video_directory": str(video_directory) if isinstance(video_directory, str) else "",
         "screen_aliases": screen_aliases if isinstance(screen_aliases, dict) else {},
@@ -368,6 +383,7 @@ def load_config() -> dict[str, Any]:
 
 
 def save_config(
+    configured_screens: list[ConfiguredScreen],
     selected_monitor_ids: list[str],
     video_directory: str,
     screen_aliases: dict[str, str],
@@ -377,6 +393,7 @@ def save_config(
 ) -> None:
     ensure_app_paths()
     payload = {
+        "configured_screens": [screen.to_dict() for screen in configured_screens],
         "selected_monitor_ids": selected_monitor_ids,
         "video_directory": video_directory,
         "screen_aliases": screen_aliases,
@@ -943,6 +960,12 @@ class UnifiedScreenTarget:
     online: bool
     detail: str = ""
     warning: str = ""
+
+
+def configured_screen_summary(screen: ConfiguredScreen) -> str:
+    capability_labels = [CAPABILITY_LABELS.get(item, item) for item in screen.capabilities]
+    capability_text = ", ".join(capability_labels) if capability_labels else "No capabilities"
+    return f"{TRANSPORT_LABELS.get(screen.transport, screen.transport)} • {capability_text}"
 
 
 class LanRemoteServer:
@@ -2997,6 +3020,206 @@ class QuickPlayTargetDialog(QDialog):
         return [screen_id for screen_id, checkbox in self.screen_checkboxes.items() if checkbox.isChecked()]
 
 
+class ConfiguredScreenEditorDialog(QDialog):
+    def __init__(self, screen: ConfiguredScreen | None = None, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.screen = screen
+        self.setWindowTitle("Configured Screen")
+        self.setModal(True)
+        self.resize(520, 420)
+        self.capability_checks: dict[str, QCheckBox] = {}
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        title = QLabel("Define a screen and the protocol it must use")
+        title.setObjectName("sectionTitle")
+        body = QLabel("This phase stores the screen contract now. Later phases will bind each protocol to real playback and discovery.")
+        body.setObjectName("sectionDescription")
+        body.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(body)
+
+        form = QFormLayout()
+        form.setSpacing(12)
+        self.name_edit = QLineEdit(self)
+        form.addRow("Name", self.name_edit)
+        self.transport_selector = QComboBox(self)
+        for transport in SCREEN_TRANSPORTS:
+            self.transport_selector.addItem(TRANSPORT_LABELS.get(transport, transport), transport)
+        self.transport_selector.currentIndexChanged.connect(self.on_transport_changed)
+        form.addRow("Protocol", self.transport_selector)
+        self.binding_edit = QLineEdit(self)
+        self.binding_edit.setPlaceholderText("Optional device id, receiver id, or protocol-specific binding")
+        form.addRow("Binding", self.binding_edit)
+        layout.addLayout(form)
+
+        capability_title = QLabel("Capabilities")
+        capability_title.setObjectName("sectionDescription")
+        layout.addWidget(capability_title)
+        capability_holder = QWidget(self)
+        capability_layout = QGridLayout(capability_holder)
+        capability_layout.setContentsMargins(0, 0, 0, 0)
+        capability_layout.setHorizontalSpacing(12)
+        capability_layout.setVerticalSpacing(8)
+        for index, capability in enumerate(SCREEN_CAPABILITIES):
+            checkbox = QCheckBox(CAPABILITY_LABELS.get(capability, capability), capability_holder)
+            self.capability_checks[capability] = checkbox
+            capability_layout.addWidget(checkbox, index // 2, index % 2)
+        layout.addWidget(capability_holder)
+
+        self.message_label = QLabel("", self)
+        self.message_label.setObjectName("messageBanner")
+        self.message_label.hide()
+        layout.addWidget(self.message_label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        if screen is not None:
+            self.name_edit.setText(screen.name)
+            self.binding_edit.setText(screen.binding.get("value", ""))
+            selected_index = self.transport_selector.findData(screen.transport)
+            if selected_index >= 0:
+                self.transport_selector.setCurrentIndex(selected_index)
+            for capability in screen.capabilities:
+                checkbox = self.capability_checks.get(capability)
+                if checkbox is not None:
+                    checkbox.setChecked(True)
+        else:
+            self.transport_selector.setCurrentIndex(0)
+        self.on_transport_changed()
+
+    def on_transport_changed(self) -> None:
+        transport = str(self.transport_selector.currentData() or "")
+        supported = set(supported_capabilities(transport))
+        for capability, checkbox in self.capability_checks.items():
+            allowed = capability in supported
+            checkbox.setEnabled(allowed)
+            if not allowed:
+                checkbox.setChecked(False)
+            elif self.screen is None and not any(item.isChecked() for item in self.capability_checks.values()):
+                checkbox.setChecked(True)
+
+    def selected_capabilities(self) -> list[str]:
+        return [capability for capability, checkbox in self.capability_checks.items() if checkbox.isChecked()]
+
+    def build_screen(self) -> ConfiguredScreen:
+        binding_value = self.binding_edit.text().strip()
+        screen = ConfiguredScreen(
+            id=self.screen.id if self.screen is not None else uuid.uuid4().hex,
+            name=self.name_edit.text().strip(),
+            transport=str(self.transport_selector.currentData() or ""),
+            capabilities=self.selected_capabilities(),
+            binding={"value": binding_value} if binding_value else {},
+        )
+        screen.validate()
+        return screen
+
+    def accept(self) -> None:  # type: ignore[override]
+        try:
+            self.build_screen()
+        except ValueError as error:
+            self.message_label.setText(str(error))
+            self.message_label.show()
+            return
+        self.message_label.hide()
+        super().accept()
+
+
+class ConfiguredScreenManagerDialog(QDialog):
+    def __init__(self, screens: list[ConfiguredScreen], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._screens = [ConfiguredScreen.from_dict(screen.to_dict()) for screen in screens]
+        self.setWindowTitle("Configured Screens")
+        self.setModal(True)
+        self.resize(720, 440)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        title = QLabel("Configured Screens")
+        title.setObjectName("sectionTitle")
+        body = QLabel("Each screen keeps an explicit protocol and capability contract. Unsupported combinations are blocked before they can be saved.")
+        body.setObjectName("sectionDescription")
+        body.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(body)
+
+        self.screen_list = QListWidget(self)
+        self.screen_list.itemDoubleClicked.connect(lambda _item: self.edit_selected_screen())
+        layout.addWidget(self.screen_list, 1)
+
+        button_row = QHBoxLayout()
+        self.add_button = QPushButton("Add", self)
+        self.add_button.clicked.connect(self.add_screen)
+        self.edit_button = QPushButton("Edit", self)
+        self.edit_button.clicked.connect(self.edit_selected_screen)
+        self.delete_button = QPushButton("Delete", self)
+        self.delete_button.setProperty("variant", "danger")
+        self.delete_button.clicked.connect(self.delete_selected_screen)
+        button_row.addWidget(self.add_button)
+        button_row.addWidget(self.edit_button)
+        button_row.addWidget(self.delete_button)
+        button_row.addStretch(1)
+        layout.addLayout(button_row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Save, parent=self)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.refresh_list()
+
+    def refresh_list(self) -> None:
+        self.screen_list.clear()
+        for screen in self._screens:
+            item = QListWidgetItem(screen.name)
+            item.setData(Qt.ItemDataRole.UserRole, screen.id)
+            item.setToolTip(configured_screen_summary(screen))
+            item.setText(f"{screen.name}\n{configured_screen_summary(screen)}")
+            self.screen_list.addItem(item)
+        if self.screen_list.count():
+            self.screen_list.setCurrentRow(0)
+
+    def selected_index(self) -> int:
+        return self.screen_list.currentRow()
+
+    def add_screen(self) -> None:
+        dialog = ConfiguredScreenEditorDialog(parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._screens.append(dialog.build_screen())
+        self.refresh_list()
+
+    def edit_selected_screen(self) -> None:
+        index = self.selected_index()
+        if index < 0 or index >= len(self._screens):
+            return
+        dialog = ConfiguredScreenEditorDialog(self._screens[index], self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._screens[index] = dialog.build_screen()
+        self.refresh_list()
+        self.screen_list.setCurrentRow(index)
+
+    def delete_selected_screen(self) -> None:
+        index = self.selected_index()
+        if index < 0 or index >= len(self._screens):
+            return
+        del self._screens[index]
+        self.refresh_list()
+        if self.screen_list.count():
+            self.screen_list.setCurrentRow(min(index, self.screen_list.count() - 1))
+
+    def configured_screens(self) -> list[ConfiguredScreen]:
+        return [ConfiguredScreen.from_dict(screen.to_dict()) for screen in self._screens]
+
+
 class VideoDropZone(QFrame):
     file_dropped = Signal(str)
 
@@ -3097,6 +3320,7 @@ class MainWindow(QMainWindow):
         self.backend_client = backend_client
         ensure_app_paths()
         config = load_config()
+        self.configured_screens = [ConfiguredScreen.from_dict(item.to_dict()) for item in config["configured_screens"]]
         self.schedules = [ScheduleEntry.from_dict(item) for item in config["schedules"]]
         self.selected_monitor_ids = [str(item) for item in config["selected_monitor_ids"]]
         self.video_directory: Path | None = Path(config["video_directory"]).expanduser() if config["video_directory"] else None
@@ -3448,6 +3672,9 @@ class MainWindow(QMainWindow):
         self.start_engine_action = QAction("Start Engine", self)
         self.start_engine_action.triggered.connect(self.start_backend_engine)
         engine_menu.addAction(self.start_engine_action)
+        self.manage_screens_action = QAction("Configured Screens...", self)
+        self.manage_screens_action.triggered.connect(self.manage_configured_screens)
+        engine_menu.addAction(self.manage_screens_action)
         self.stop_engine_action = QAction("Stop Engine", self)
         self.stop_engine_action.triggered.connect(self.stop_backend_engine)
         engine_menu.addAction(self.stop_engine_action)
@@ -3901,6 +4128,7 @@ class MainWindow(QMainWindow):
             return
         self.start_engine_action.setEnabled(not self.backend_online)
         self.stop_engine_action.setEnabled(self.backend_online)
+        self.manage_screens_action.setEnabled(True)
         if hasattr(self, "retry_firewall_action"):
             self.retry_firewall_action.setEnabled(self.backend_online)
         self.refresh_engine_action.setEnabled(True)
@@ -3989,6 +4217,18 @@ class MainWindow(QMainWindow):
             self.set_form_message("Background engine stopped.", "success")
         else:
             self.set_form_message("Background engine was not running or could not be stopped.", "error")
+
+    def manage_configured_screens(self, checked: bool = False) -> None:
+        dialog = ConfiguredScreenManagerDialog(self.configured_screens, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        updated_screens = dialog.configured_screens()
+        response = self.call_backend_action(
+            "set_configured_screens",
+            {"configured_screens": [screen.to_dict() for screen in updated_screens]},
+        )
+        if response is not None:
+            self.set_form_message(f"Configured screens saved ({len(self.configured_screens)}).", "success")
 
     def retry_lan_firewall_setup(self, checked: bool = False) -> None:
         response = self.call_backend_action("retry_firewall_setup")
@@ -4567,6 +4807,7 @@ class MainWindow(QMainWindow):
         self.backend_online = True
         self.backend_state_version = int(snapshot.get("stateVersion") or self.backend_state_version)
         self.backend_listener.seed_state_version(self.backend_state_version)
+        self.configured_screens = parse_configured_screens(snapshot.get("configuredScreens"))
         schedules_payload = snapshot.get("schedules") or []
         self.schedules = [ScheduleEntry.from_dict(item) for item in schedules_payload if isinstance(item, dict)]
         self.selected_monitor_ids = [str(item) for item in snapshot.get("selectedMonitorIds") or []]
@@ -5310,6 +5551,7 @@ class ControllerEngine(QObject):
         self.media_scan_in_progress = False
         self.media_scan_error = ""
         config = load_config()
+        self.configured_screens = [ConfiguredScreen.from_dict(item.to_dict()) for item in config["configured_screens"]]
         self.schedules = [ScheduleEntry.from_dict(item) for item in config["schedules"]]
         self.selected_monitor_ids = [str(item) for item in config["selected_monitor_ids"]]
         self.video_directory: Path | None = Path(config["video_directory"]).expanduser() if config["video_directory"] else None
@@ -5439,6 +5681,7 @@ class ControllerEngine(QObject):
 
     def persist_state(self) -> None:
         save_config(
+            self.configured_screens,
             self.selected_monitor_ids,
             str(self.video_directory) if self.video_directory is not None else "",
             self.screen_aliases,
@@ -5740,6 +5983,7 @@ class ControllerEngine(QObject):
         )
         return {
             "stateVersion": self._state_version,
+            "configuredScreens": [screen.to_dict() for screen in self.configured_screens],
             "selectedMonitorIds": self.selected_monitor_ids,
             "videoDirectory": str(self.video_directory) if self.video_directory is not None else "",
             "screenAliases": self.screen_aliases,
@@ -5836,6 +6080,9 @@ class ControllerEngine(QObject):
         elif action == "set_run_at_startup":
             self.run_at_startup = bool(payload.get("value"))
             self.sync_startup_registration()
+            self.persist_state()
+        elif action == "set_configured_screens":
+            self.configured_screens = validate_configured_screens(payload.get("configured_screens"))
             self.persist_state()
         elif action == "save_schedule":
             raw_schedule = payload.get("schedule")
