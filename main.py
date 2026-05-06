@@ -85,6 +85,14 @@ from dlna_support import (
     resolve_dlna_commands,
     validate_unique_dlna_bindings,
 )
+from miracast_support import (
+    MIRACAST_BINDING_KEY,
+    MiracastDevice,
+    miracast_binding_device_id,
+    miracast_target_status_detail,
+    parse_miracast_devices_from_pnp_json,
+    validate_unique_miracast_bindings,
+)
 from screen_protocols import (
     CAPABILITY_LABELS,
     SCREEN_CAPABILITIES,
@@ -1193,6 +1201,60 @@ class DlnaAdapter:
         )
         with urlopen(request, timeout=4.0) as response:
             response.read()
+
+
+class MiracastAdapter:
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._devices: dict[str, dict[str, Any]] = {}
+        self._change_callback = None
+
+    def set_change_callback(self, callback) -> None:
+        self._change_callback = callback
+
+    def _notify_change(self) -> None:
+        callback = self._change_callback
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                return
+
+    def devices_snapshot(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [dict(item) for item in sorted(self._devices.values(), key=lambda device: str(device.get("friendly_name") or device.get("device_id") or "").lower())]
+
+    def devices_by_id(self) -> dict[str, dict[str, Any]]:
+        with self._lock:
+            return {device_id: dict(device) for device_id, device in self._devices.items()}
+
+    def refresh_discovery(self) -> None:
+        command = (
+            "$devices = Get-PnpDevice | "
+            "Select-Object Status,Class,FriendlyName,InstanceId; "
+            "$devices | ConvertTo-Json -Depth 2"
+        )
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", command],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=8.0,
+                **windows_hidden_subprocess_kwargs(),
+            )
+        except OSError:
+            return
+        if result.returncode != 0:
+            return
+        devices = parse_miracast_devices_from_pnp_json(result.stdout or "")
+        discovered = {device.device_id: device.to_dict() for device in devices}
+        with self._lock:
+            previous = json.dumps(self._devices, sort_keys=True)
+            current = json.dumps(discovered, sort_keys=True)
+            self._devices = discovered
+        if previous != current:
+            self._notify_change()
 
 
 class LanRemoteServer:
@@ -3268,12 +3330,14 @@ class ConfiguredScreenEditorDialog(QDialog):
         screen: ConfiguredScreen | None = None,
         remote_screens: dict[str, dict[str, Any]] | None = None,
         dlna_devices: dict[str, dict[str, Any]] | None = None,
+        miracast_devices: dict[str, dict[str, Any]] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.screen = screen
         self.remote_screens = {str(key): dict(value) for key, value in (remote_screens or {}).items()}
         self.dlna_devices = {str(key): dict(value) for key, value in (dlna_devices or {}).items()}
+        self.miracast_devices = {str(key): dict(value) for key, value in (miracast_devices or {}).items()}
         self.setWindowTitle("Configured Screen")
         self.setModal(True)
         self.resize(520, 420)
@@ -3335,7 +3399,7 @@ class ConfiguredScreenEditorDialog(QDialog):
 
         if screen is not None:
             self.name_edit.setText(screen.name)
-            initial_binding = browser_binding_remote_id(screen) or dlna_binding_usn(screen) or screen.binding.get("value", "")
+            initial_binding = browser_binding_remote_id(screen) or dlna_binding_usn(screen) or miracast_binding_device_id(screen) or screen.binding.get("value", "")
             self.binding_edit.setText(initial_binding)
             selected_index = self.transport_selector.findData(screen.transport)
             if selected_index >= 0:
@@ -3363,8 +3427,8 @@ class ConfiguredScreenEditorDialog(QDialog):
 
     def refresh_transport_binding_selector(self) -> None:
         transport = str(self.transport_selector.currentData() or "")
-        self.binding_selector.setVisible(transport in {"browser", "dlna"})
-        if transport not in {"browser", "dlna"}:
+        self.binding_selector.setVisible(transport in {"browser", "dlna", "miracast"})
+        if transport not in {"browser", "dlna", "miracast"}:
             return
         self.binding_selector.blockSignals(True)
         self.binding_selector.clear()
@@ -3381,6 +3445,13 @@ class ConfiguredScreenEditorDialog(QDialog):
                 ip = str(device.get("ip") or "")
                 label = f"{name} ({ip})" if ip else name
                 self.binding_selector.addItem(label, usn)
+        elif transport == "miracast":
+            self.binding_selector.addItem("Bind manually or choose a discovered Miracast device", "")
+            for device_id, device in sorted(self.miracast_devices.items(), key=lambda item: str(item[1].get("friendly_name") or item[0]).lower()):
+                name = str(device.get("friendly_name") or device_id)
+                detail = str(device.get("detail") or "")
+                label = f"{name} ({detail})" if detail else name
+                self.binding_selector.addItem(label, device_id)
         current_binding = self.binding_edit.text().strip()
         if current_binding:
             index = self.binding_selector.findData(current_binding)
@@ -3405,6 +3476,8 @@ class ConfiguredScreenEditorDialog(QDialog):
                 binding = {BROWSER_BINDING_KEY: binding_value}
             elif transport == "dlna":
                 binding = {DLNA_BINDING_KEY: binding_value}
+            elif transport == "miracast":
+                binding = {MIRACAST_BINDING_KEY: binding_value}
             else:
                 binding = {"value": binding_value}
         screen = ConfiguredScreen(
@@ -3434,12 +3507,14 @@ class ConfiguredScreenManagerDialog(QDialog):
         screens: list[ConfiguredScreen],
         remote_screens: dict[str, dict[str, Any]] | None = None,
         dlna_devices: dict[str, dict[str, Any]] | None = None,
+        miracast_devices: dict[str, dict[str, Any]] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._screens = [ConfiguredScreen.from_dict(screen.to_dict()) for screen in screens]
         self.remote_screens = {str(key): dict(value) for key, value in (remote_screens or {}).items()}
         self.dlna_devices = {str(key): dict(value) for key, value in (dlna_devices or {}).items()}
+        self.miracast_devices = {str(key): dict(value) for key, value in (miracast_devices or {}).items()}
         self.setWindowTitle("Configured Screens")
         self.setModal(True)
         self.resize(720, 440)
@@ -3496,7 +3571,12 @@ class ConfiguredScreenManagerDialog(QDialog):
         return self.screen_list.currentRow()
 
     def add_screen(self) -> None:
-        dialog = ConfiguredScreenEditorDialog(remote_screens=self.remote_screens, dlna_devices=self.dlna_devices, parent=self)
+        dialog = ConfiguredScreenEditorDialog(
+            remote_screens=self.remote_screens,
+            dlna_devices=self.dlna_devices,
+            miracast_devices=self.miracast_devices,
+            parent=self,
+        )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self._screens.append(dialog.build_screen())
@@ -3506,7 +3586,7 @@ class ConfiguredScreenManagerDialog(QDialog):
         index = self.selected_index()
         if index < 0 or index >= len(self._screens):
             return
-        dialog = ConfiguredScreenEditorDialog(self._screens[index], self.remote_screens, self.dlna_devices, self)
+        dialog = ConfiguredScreenEditorDialog(self._screens[index], self.remote_screens, self.dlna_devices, self.miracast_devices, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self._screens[index] = dialog.build_screen()
@@ -3783,6 +3863,7 @@ class MainWindow(QMainWindow):
         try:
             validate_unique_browser_bindings(self.configured_screens)
             validate_unique_dlna_bindings(self.configured_screens)
+            validate_unique_miracast_bindings(self.configured_screens)
         except ValueError:
             self.configured_screens = []
         self.screen_groups = [ScreenGroup.from_dict(item.to_dict()) for item in config["screen_groups"]]
@@ -3807,6 +3888,7 @@ class MainWindow(QMainWindow):
         self.current_active_screen_count = 0
         self.remote_screens: dict[str, dict[str, Any]] = {}
         self.dlna_devices: dict[str, dict[str, Any]] = {}
+        self.miracast_devices: dict[str, dict[str, Any]] = {}
         self.backend_network_snapshot: dict[str, Any] = {}
         self.backend_online = False
         self.backend_state_version = 0
@@ -4151,6 +4233,12 @@ class MainWindow(QMainWindow):
         self.refresh_dlna_action = QAction("Refresh DLNA Discovery", self)
         self.refresh_dlna_action.triggered.connect(self.refresh_dlna_discovery)
         engine_menu.addAction(self.refresh_dlna_action)
+        self.refresh_miracast_action = QAction("Refresh Miracast Discovery", self)
+        self.refresh_miracast_action.triggered.connect(self.refresh_miracast_discovery)
+        engine_menu.addAction(self.refresh_miracast_action)
+        self.open_windows_display_settings_action = QAction("Open Windows Display Settings", self)
+        self.open_windows_display_settings_action.triggered.connect(self.open_windows_display_settings)
+        engine_menu.addAction(self.open_windows_display_settings_action)
         self.refresh_engine_action = QAction("Refresh Engine Status", self)
         self.refresh_engine_action.triggered.connect(lambda: self.pull_backend_state(initial=False))
         engine_menu.addAction(self.refresh_engine_action)
@@ -4162,6 +4250,7 @@ class MainWindow(QMainWindow):
         self.rename_screens_menu = screen_menu.addMenu("Name Screens")
         self.remote_screens_menu = screen_menu.addMenu("Remote LAN Screens")
         self.dlna_screens_menu = screen_menu.addMenu("Discovered DLNA Devices")
+        self.miracast_screens_menu = screen_menu.addMenu("Discovered Miracast Devices")
         refresh_screens_action = QAction("Refresh Screens", self)
         refresh_screens_action.triggered.connect(self.refresh_monitors)
         screen_menu.addAction(refresh_screens_action)
@@ -4693,7 +4782,7 @@ class MainWindow(QMainWindow):
             self.set_form_message("Background engine was not running or could not be stopped.", "error")
 
     def manage_configured_screens(self, checked: bool = False) -> None:
-        dialog = ConfiguredScreenManagerDialog(self.configured_screens, self.remote_screens, self.dlna_devices, self)
+        dialog = ConfiguredScreenManagerDialog(self.configured_screens, self.remote_screens, self.dlna_devices, self.miracast_devices, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         updated_screens = dialog.configured_screens()
@@ -4740,6 +4829,19 @@ class MainWindow(QMainWindow):
         response = self.call_backend_action("refresh_dlna_discovery")
         if response is not None:
             self.set_form_message(f"DLNA discovery refreshed ({len(self.dlna_devices)} device(s) found).", "success")
+
+    def refresh_miracast_discovery(self, checked: bool = False) -> None:
+        response = self.call_backend_action("refresh_miracast_discovery")
+        if response is not None:
+            self.set_form_message(f"Miracast discovery refreshed ({len(self.miracast_devices)} device(s) found).", "success")
+
+    def open_windows_display_settings(self, checked: bool = False) -> None:
+        try:
+            if sys.platform == "win32":
+                os.startfile("ms-settings:display")
+                self.set_form_message("Opened Windows display settings. Use 'Connect to a wireless display' there.", "success")
+        except OSError as error:
+            self.set_form_message(f"Could not open Windows display settings: {error}", "error")
 
     def handle_toggle_pause(self, checked: bool = False) -> None:
         self.call_backend_action("toggle_pause")
@@ -4800,6 +4902,7 @@ class MainWindow(QMainWindow):
 
     def unified_screen_targets(self, include_offline: bool = True) -> list[UnifiedScreenTarget]:
         targets: list[UnifiedScreenTarget] = []
+        static_media_ids = self.static_media_configured_screen_ids()
         for screen in available_screens():
             identifier = screen_identifier(screen)
             geometry = screen.geometry()
@@ -4813,6 +4916,8 @@ class MainWindow(QMainWindow):
                 )
             )
         for screen in sorted((item for item in self.configured_screens if item.transport == "browser"), key=lambda item: item.name.lower()):
+            if screen.id not in static_media_ids:
+                continue
             online, detail, warning = browser_target_status_detail(screen, self.remote_screens)
             if not include_offline and not online:
                 continue
@@ -4827,6 +4932,8 @@ class MainWindow(QMainWindow):
                 )
             )
         for screen in sorted((item for item in self.configured_screens if item.transport == "dlna"), key=lambda item: item.name.lower()):
+            if screen.id not in static_media_ids:
+                continue
             online, detail, warning = dlna_target_status_detail(screen, self.dlna_devices)
             if not include_offline and not online:
                 continue
@@ -4920,6 +5027,7 @@ class MainWindow(QMainWindow):
         self.rename_screens_menu.clear()
         self.remote_screens_menu.clear()
         self.dlna_screens_menu.clear()
+        self.miracast_screens_menu.clear()
         self.schedule_screen_menu.clear()
         configured_transport_by_id = {screen.id: screen.transport for screen in self.configured_screens}
         for group in self.all_screen_groups():
@@ -4965,6 +5073,12 @@ class MainWindow(QMainWindow):
             ip = str(device.get("ip") or "")
             detail = f"DLNA renderer • {ip}" if ip else "DLNA renderer"
             action = self.dlna_screens_menu.addAction(name)
+            action.setEnabled(False)
+            action.setToolTip(detail)
+        for device_id, device in sorted(self.miracast_devices.items(), key=lambda item: str(item[1].get("friendly_name") or item[0]).lower()):
+            name = str(device.get("friendly_name") or device_id)
+            detail = str(device.get("detail") or "Miracast device")
+            action = self.miracast_screens_menu.addAction(name)
             action.setEnabled(False)
             action.setToolTip(detail)
         self.update_monitor_summary()
@@ -5352,6 +5466,11 @@ class MainWindow(QMainWindow):
             str(item.get("usn")): item
             for item in snapshot.get("dlnaDevices") or []
             if isinstance(item, dict) and item.get("usn")
+        }
+        self.miracast_devices = {
+            str(item.get("device_id")): item
+            for item in snapshot.get("miracastDevices") or []
+            if isinstance(item, dict) and item.get("device_id")
         }
         self.backend_network_snapshot = dict(snapshot.get("network") or {})
         library = snapshot.get("library") or {}
@@ -6080,6 +6199,7 @@ class ControllerEngine(QObject):
         try:
             validate_unique_browser_bindings(self.configured_screens)
             validate_unique_dlna_bindings(self.configured_screens)
+            validate_unique_miracast_bindings(self.configured_screens)
         except ValueError:
             self.configured_screens = []
         self.screen_groups = [ScreenGroup.from_dict(item.to_dict()) for item in config["screen_groups"]]
@@ -6095,6 +6215,7 @@ class ControllerEngine(QObject):
         self.available_videos: list[Path] = []
         self.remote_screens: dict[str, dict[str, Any]] = {}
         self.dlna_devices: dict[str, dict[str, Any]] = {}
+        self.miracast_devices: dict[str, dict[str, Any]] = {}
         self.status_clock_label, self.status_active_label = current_uk_time_status(self.schedules)
         self.local_window_count = 0
         self.local_playback_workers: dict[str, subprocess.Popen] = {}
@@ -6114,6 +6235,9 @@ class ControllerEngine(QObject):
         self.dlna_refresh_timer = QTimer(self)
         self.dlna_refresh_timer.setInterval(15000)
         self.dlna_refresh_timer.timeout.connect(self.refresh_dlna_devices)
+        self.miracast_refresh_timer = QTimer(self)
+        self.miracast_refresh_timer.setInterval(15000)
+        self.miracast_refresh_timer.timeout.connect(self.refresh_miracast_devices)
         self.firewall_check_timer = QTimer(self)
         self.firewall_check_timer.setInterval(60000)
         self.firewall_check_timer.timeout.connect(self.ensure_firewall_access)
@@ -6134,6 +6258,8 @@ class ControllerEngine(QObject):
         self.remote_server.start()
         self.dlna_adapter = DlnaAdapter()
         self.dlna_adapter.set_change_callback(self.on_dlna_devices_changed)
+        self.miracast_adapter = MiracastAdapter()
+        self.miracast_adapter.set_change_callback(self.on_miracast_devices_changed)
         self.control_server = EngineControlServer(self)
         self.control_server.start()
         self.apply_video_directory_watch()
@@ -6141,10 +6267,12 @@ class ControllerEngine(QObject):
         self.sync_playback_outputs()
         self.refresh_remote_screens()
         self.refresh_dlna_devices()
+        self.refresh_miracast_devices()
         self.ensure_firewall_access(force_retry=False)
         self.sync_startup_registration()
         self.remote_refresh_timer.start()
         self.dlna_refresh_timer.start()
+        self.miracast_refresh_timer.start()
         self.firewall_check_timer.start()
 
     def on_status_changed(self, clock_label: str, active_label: str) -> None:
@@ -6153,6 +6281,9 @@ class ControllerEngine(QObject):
 
     def on_dlna_devices_changed(self) -> None:
         self.refresh_dlna_devices(notify_only=True)
+
+    def on_miracast_devices_changed(self) -> None:
+        self.refresh_miracast_devices(notify_only=True)
 
     def browser_configured_screens(self) -> list[ConfiguredScreen]:
         return [screen for screen in self.configured_screens if screen.transport == "browser"]
@@ -6165,6 +6296,16 @@ class ControllerEngine(QObject):
 
     def dlna_configured_screen_ids(self) -> set[str]:
         return {screen.id for screen in self.dlna_configured_screens()}
+
+    def miracast_configured_screens(self) -> list[ConfiguredScreen]:
+        return [screen for screen in self.configured_screens if screen.transport == "miracast"]
+
+    def static_media_configured_screen_ids(self) -> set[str]:
+        return {
+            screen.id
+            for screen in self.configured_screens
+            if "static_media" in screen.capabilities
+        }
 
     def all_screen_groups(self) -> list[ScreenGroup]:
         return combined_screen_groups(self.selected_monitor_ids, self.screen_groups)
@@ -6362,6 +6503,19 @@ class ControllerEngine(QObject):
         if current != previous:
             self.notify_state_changed()
 
+    def refresh_miracast_devices(self, notify_only: bool = False) -> None:
+        previous = json.dumps(self.miracast_devices, sort_keys=True)
+        if not notify_only:
+            self.miracast_adapter.refresh_discovery()
+        self.miracast_devices = {
+            str(item.get("device_id")): item
+            for item in self.miracast_adapter.devices_snapshot()
+            if isinstance(item, dict) and item.get("device_id")
+        }
+        current = json.dumps(self.miracast_devices, sort_keys=True)
+        if current != previous:
+            self.notify_state_changed()
+
     def ensure_firewall_access(self, force_retry: bool = False) -> None:
         before_warning = self.remote_server.network_snapshot().get("warnings") or []
         before_configured = bool(self.remote_server.network_snapshot().get("firewallConfigured"))
@@ -6387,6 +6541,8 @@ class ControllerEngine(QObject):
                 )
             )
         for screen in sorted(self.browser_configured_screens(), key=lambda item: item.name.lower()):
+            if screen.id not in static_media_ids:
+                continue
             online, detail, warning = browser_target_status_detail(screen, self.remote_screens)
             if not include_offline and not online:
                 continue
@@ -6401,6 +6557,8 @@ class ControllerEngine(QObject):
                 )
             )
         for screen in sorted(self.dlna_configured_screens(), key=lambda item: item.name.lower()):
+            if screen.id not in static_media_ids:
+                continue
             online, detail, warning = dlna_target_status_detail(screen, self.dlna_devices)
             if not include_offline and not online:
                 continue
@@ -6613,6 +6771,7 @@ class ControllerEngine(QObject):
             },
             "remoteScreens": self.remote_server.remote_screens_snapshot(),
             "dlnaDevices": self.dlna_adapter.devices_snapshot(),
+            "miracastDevices": self.miracast_adapter.devices_snapshot(),
             "network": self.remote_server.network_snapshot(),
             "screens": [
                 {
@@ -6696,6 +6855,8 @@ class ControllerEngine(QObject):
             self.ensure_firewall_access(force_retry=True)
         elif action == "refresh_dlna_discovery":
             self.refresh_dlna_devices()
+        elif action == "refresh_miracast_discovery":
+            self.refresh_miracast_devices()
         elif action == "set_run_at_startup":
             self.run_at_startup = bool(payload.get("value"))
             self.sync_startup_registration()
@@ -6704,6 +6865,7 @@ class ControllerEngine(QObject):
             self.configured_screens = validate_configured_screens(payload.get("configured_screens"))
             validate_unique_browser_bindings(self.configured_screens)
             validate_unique_dlna_bindings(self.configured_screens)
+            validate_unique_miracast_bindings(self.configured_screens)
             self.screen_aliases.update(configured_screen_name_map(self.configured_screens))
             self.coordinator.set_virtual_screen_ids(self.browser_configured_screen_ids())
             self.persist_state()
@@ -6751,6 +6913,7 @@ class ControllerEngine(QObject):
         self.folder_refresh_timer.stop()
         self.remote_refresh_timer.stop()
         self.dlna_refresh_timer.stop()
+        self.miracast_refresh_timer.stop()
         self.firewall_check_timer.stop()
         watched_paths = self.folder_watcher.directories()
         if watched_paths:

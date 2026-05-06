@@ -41,11 +41,13 @@ App test:
 ## Phase 4
 - Add a Miracast adapter for live display/app view.
 - Allow configured Miracast screens to bind to Miracast sessions/devices.
-- Route live-view actions through Miracast for configured Miracast screens.
+- Use Windows-managed connection flow for actual wireless-display session setup.
+- Route live-view actions through Miracast for configured Miracast screens in the later live-view phase.
 
 App test:
-- Start a live-view session to a configured Miracast screen
-- Verify view-only streaming starts and stops cleanly
+- Refresh Miracast discovery
+- Bind a configured Miracast screen to a discovered wireless-display candidate
+- Open Windows display settings from the app and confirm the connection flow is reachable
 
 ## Phase 5
 - Add configured live-view routing for browser screens.
