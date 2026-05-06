@@ -2,6 +2,7 @@
 branch = True
 source =
     browser_screen_bindings
+    screen_groups
     screen_protocols
 
 [report]

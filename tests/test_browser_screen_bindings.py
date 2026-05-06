@@ -140,7 +140,15 @@ def test_browser_target_status_detail_without_ip_keeps_size_only() -> None:
 def test_resolve_browser_commands_maps_configured_browser_screen_to_bound_remote_id() -> None:
     configured_screens = [make_browser_screen("screen-1", "TV", {BROWSER_BINDING_KEY: "remote:abc"})]
     remote_screens = {"remote:abc": {"screen_id": "remote:abc", "online": True}}
-    commands = {"screen-1": {"type": "play", "label": "Demo", "screenId": "screen-1"}}
+    commands = {
+        "screen-1": {
+            "type": "play",
+            "label": "Demo",
+            "screenId": "screen-1",
+            "mediaUrl": "/media/demo.mp4",
+            "mediaKind": "video",
+        }
+    }
 
     resolved = resolve_browser_commands(configured_screens, remote_screens, commands)
 
@@ -149,6 +157,8 @@ def test_resolve_browser_commands_maps_configured_browser_screen_to_bound_remote
             "type": "play",
             "label": "Demo",
             "screenId": "remote:abc",
+            "mediaUrl": "/media/demo.mp4",
+            "mediaKind": "video",
             "configuredScreenId": "screen-1",
             "configuredScreenName": "TV",
         }

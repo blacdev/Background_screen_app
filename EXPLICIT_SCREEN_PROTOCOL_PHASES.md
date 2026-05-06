@@ -59,3 +59,7 @@ App test:
 ## Coverage Rule
 - All new pure protocol modules must have 100% unit-test coverage before a phase is complete.
 - UI integration remains phase-testable through the app, while protocol/business logic must stay in separately testable modules.
+
+## Noted Next Media Feature
+- Time slots will later support multiple images/media items inside one slot.
+- That future change should be built on top of explicit target groups so media rotation and per-screen switching can happen without reworking the target model again.

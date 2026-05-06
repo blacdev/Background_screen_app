@@ -81,6 +81,19 @@ from screen_protocols import (
     supported_capabilities,
     validate_configured_screens,
 )
+from screen_groups import (
+    DEFAULT_GROUP_ID,
+    DEFAULT_GROUP_NAME,
+    ScreenGroup,
+    combined_screen_groups,
+    expand_target_ids,
+    is_group_target_id,
+    normalize_schedule_target_ids,
+    parse_screen_groups,
+    target_contains_screen,
+    target_label_map,
+    validate_screen_groups,
+)
 
 
 # Long-running local playback has been more stable when Qt is allowed to use
@@ -246,6 +259,10 @@ class ScheduleEntry:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ScheduleEntry":
+        raw_screen_ids = [str(item) for item in data.get("screen_ids", []) if isinstance(item, str)]
+        normalized_screen_ids = normalize_schedule_target_ids(raw_screen_ids)
+        if not normalized_screen_ids:
+            normalized_screen_ids = [DEFAULT_GROUP_ID]
         return cls(
             id=str(data.get("id") or uuid.uuid4().hex),
             title=str(data.get("title") or "Untitled schedule"),
@@ -253,7 +270,7 @@ class ScheduleEntry:
             end_time=str(data.get("end_time") or "00:00"),
             video_file=str(data.get("video_file") or ""),
             video_label=str(data.get("video_label") or data.get("video_file") or ""),
-            screen_ids=[str(item) for item in data.get("screen_ids", []) if isinstance(item, str)],
+            screen_ids=normalized_screen_ids,
             days=[key for item in data.get("days", []) if isinstance(item, str) if (key := normalize_day_key(item)) is not None],
         )
 
@@ -351,6 +368,7 @@ def load_config() -> dict[str, Any]:
     if not CONFIG_PATH.exists():
         return {
             "configured_screens": [],
+            "screen_groups": [],
             "selected_monitor_ids": [],
             "video_directory": "",
             "screen_aliases": {},
@@ -364,6 +382,7 @@ def load_config() -> dict[str, Any]:
     except (json.JSONDecodeError, OSError):
         return {
             "configured_screens": [],
+            "screen_groups": [],
             "selected_monitor_ids": [],
             "video_directory": "",
             "screen_aliases": {},
@@ -374,6 +393,7 @@ def load_config() -> dict[str, Any]:
 
     selected = data.get("selected_monitor_ids")
     configured_screens = parse_configured_screens(data.get("configured_screens"))
+    screen_groups = parse_screen_groups(data.get("screen_groups"))
     schedules = data.get("schedules")
     video_directory = data.get("video_directory")
     screen_aliases = data.get("screen_aliases")
@@ -381,6 +401,7 @@ def load_config() -> dict[str, Any]:
     run_at_startup = data.get("run_at_startup")
     return {
         "configured_screens": configured_screens,
+        "screen_groups": screen_groups,
         "selected_monitor_ids": selected if isinstance(selected, list) else [],
         "video_directory": str(video_directory) if isinstance(video_directory, str) else "",
         "screen_aliases": screen_aliases if isinstance(screen_aliases, dict) else {},
@@ -392,6 +413,7 @@ def load_config() -> dict[str, Any]:
 
 def save_config(
     configured_screens: list[ConfiguredScreen],
+    screen_groups: list[ScreenGroup],
     selected_monitor_ids: list[str],
     video_directory: str,
     screen_aliases: dict[str, str],
@@ -402,6 +424,7 @@ def save_config(
     ensure_app_paths()
     payload = {
         "configured_screens": [screen.to_dict() for screen in configured_screens],
+        "screen_groups": [group.to_dict() for group in screen_groups],
         "selected_monitor_ids": selected_monitor_ids,
         "video_directory": video_directory,
         "screen_aliases": screen_aliases,
@@ -546,14 +569,23 @@ def schedule_targets_overlap(first: list[str], second: list[str]) -> bool:
     return bool(set(first) & set(second))
 
 
-def active_schedule_for_screen(schedules: list[ScheduleEntry], weekday_index: int, minute_of_day: int, screen_id: str) -> ScheduleEntry | None:
+def active_schedule_for_screen(
+    schedules: list[ScheduleEntry],
+    weekday_index: int,
+    minute_of_day: int,
+    screen_id: str,
+    screen_groups: list[ScreenGroup],
+) -> ScheduleEntry | None:
     for entry in sorted(schedules, key=lambda item: ScheduleEntry.time_to_minutes(item.start_time)):
-        if entry.covers_weekday_minute(weekday_index, minute_of_day) and (not entry.screen_ids or screen_id in entry.screen_ids):
+        if entry.covers_weekday_minute(weekday_index, minute_of_day) and target_contains_screen(entry.screen_ids, screen_id, screen_groups):
             return entry
     return None
 
 
-def screen_label_from_id(screen_id: str, aliases: dict[str, str]) -> str:
+def screen_label_from_id(screen_id: str, aliases: dict[str, str], screen_groups: list[ScreenGroup] | None = None) -> str:
+    if is_group_target_id(screen_id):
+        group_labels = target_label_map(screen_groups or [])
+        return group_labels.get(screen_id, screen_id)
     screen = find_screen_by_id(screen_id)
     if screen is not None:
         return screen_display_name(screen, aliases)
@@ -563,14 +595,21 @@ def screen_label_from_id(screen_id: str, aliases: dict[str, str]) -> str:
     return screen_id.split("|", 1)[0]
 
 
-def format_screen_targets(screen_ids: list[str], aliases: dict[str, str]) -> str:
+def format_screen_targets(screen_ids: list[str], aliases: dict[str, str], screen_groups: list[ScreenGroup] | None = None) -> str:
     if not screen_ids:
-        return "All selected screens"
-    return ", ".join(screen_label_from_id(screen_id, aliases) for screen_id in screen_ids)
+        return "No targets selected"
+    return ", ".join(screen_label_from_id(screen_id, aliases, screen_groups) for screen_id in screen_ids)
 
 
-def disconnected_screen_ids(screen_ids: list[str]) -> list[str]:
-    return [screen_id for screen_id in screen_ids if find_screen_by_id(screen_id) is None]
+def disconnected_screen_ids(screen_ids: list[str], screen_groups: list[ScreenGroup] | None = None) -> list[str]:
+    group_ids = target_label_map(screen_groups or [])
+    disconnected: list[str] = []
+    for screen_id in screen_ids:
+        if screen_id in group_ids:
+            continue
+        if find_screen_by_id(screen_id) is None:
+            disconnected.append(screen_id)
+    return disconnected
 
 def referenced_video_files(schedules: list[ScheduleEntry]) -> set[str]:
     return {entry.video_file for entry in schedules if entry.video_file}
@@ -2258,6 +2297,7 @@ class PlaybackCoordinator(QWidget):
         self.quick_play_paths: dict[str, Path] = {}
         self.quick_play_labels: dict[str, str] = {}
         self.virtual_screen_ids: set[str] = set()
+        self.screen_groups: list[ScreenGroup] = []
         self.command_version = 0
         self.screen_commands: dict[str, dict[str, Any]] = {}
         self.last_assignment_keys: dict[str, str] = {}
@@ -2291,6 +2331,10 @@ class PlaybackCoordinator(QWidget):
 
     def set_virtual_screen_ids(self, screen_ids: set[str]) -> None:
         self.virtual_screen_ids = set(screen_ids)
+        self.sync_current_entry(force=True)
+
+    def set_screen_groups(self, groups: list[ScreenGroup]) -> None:
+        self.screen_groups = [ScreenGroup.from_dict(group.to_dict()) for group in groups]
         self.sync_current_entry(force=True)
 
     def launch_windows(self) -> None:
@@ -2376,13 +2420,12 @@ class PlaybackCoordinator(QWidget):
     def all_active_screen_ids(self) -> list[str]:
         if not self.playback_enabled:
             return sorted(set(self.quick_play_paths.keys()))
-        schedule_remote_targets = {
+        schedule_targets = {
             screen_id
             for entry in self.schedules
-            for screen_id in entry.screen_ids
-            if is_remote_screen_id(screen_id) or screen_id in self.virtual_screen_ids
+            for screen_id in expand_target_ids(entry.screen_ids, self.screen_groups)
         }
-        return sorted(set(self.selected_monitor_ids) | set(self.quick_play_paths.keys()) | schedule_remote_targets)
+        return sorted(set(self.selected_monitor_ids) | set(self.quick_play_paths.keys()) | schedule_targets)
 
     def has_launch_targets(self) -> bool:
         if self.selected_monitor_ids or self.quick_play_paths:
@@ -2401,7 +2444,7 @@ class PlaybackCoordinator(QWidget):
                 "entry_id": f"override:{screen_id}",
                 "message": "",
             }
-        entry = active_schedule_for_screen(self.schedules, weekday_index, minute_of_day, screen_id)
+        entry = active_schedule_for_screen(self.schedules, weekday_index, minute_of_day, screen_id, self.screen_groups)
         if entry is None:
             return {
                 "key": f"clear:{screen_id}",
@@ -2545,7 +2588,7 @@ class PlaybackCoordinator(QWidget):
         active_entries = [
             entry
             for screen_id in self.selected_monitor_ids
-            if (entry := active_schedule_for_screen(self.schedules, weekday_index, minute_of_day, screen_id)) is not None
+            if (entry := active_schedule_for_screen(self.schedules, weekday_index, minute_of_day, screen_id, self.screen_groups)) is not None
         ]
         if not active_entries:
             status = "No active schedule"
@@ -3285,6 +3328,159 @@ class ConfiguredScreenManagerDialog(QDialog):
         return [ConfiguredScreen.from_dict(screen.to_dict()) for screen in self._screens]
 
 
+class ScreenGroupEditorDialog(QDialog):
+    def __init__(
+        self,
+        targets: list[UnifiedScreenTarget],
+        group: ScreenGroup | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.group = group
+        self.targets = [target for target in targets if not is_group_target_id(target.id)]
+        self.checkboxes: dict[str, QCheckBox] = {}
+        self.setWindowTitle("Screen Group")
+        self.setModal(True)
+        self.resize(420, 420)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+        self.name_edit = QLineEdit(self)
+        layout.addWidget(QLabel("Group Name"))
+        layout.addWidget(self.name_edit)
+        layout.addWidget(QLabel("Screens in this group"))
+        holder = QWidget(self)
+        holder_layout = QVBoxLayout(holder)
+        holder_layout.setContentsMargins(0, 0, 0, 0)
+        holder_layout.setSpacing(8)
+        selected_ids = set(group.screen_ids if group is not None else [])
+        for target in self.targets:
+            checkbox = QCheckBox(target.label, holder)
+            checkbox.setChecked(target.id in selected_ids)
+            checkbox.setToolTip(target.detail or target.label)
+            self.checkboxes[target.id] = checkbox
+            holder_layout.addWidget(checkbox)
+        holder_layout.addStretch(1)
+        layout.addWidget(holder, 1)
+        self.message_label = QLabel("", self)
+        self.message_label.setObjectName("messageBanner")
+        self.message_label.hide()
+        layout.addWidget(self.message_label)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok, parent=self)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        if group is not None:
+            self.name_edit.setText(group.name)
+
+    def build_group(self) -> ScreenGroup:
+        group = ScreenGroup(
+            id=self.group.id if self.group is not None else f"group:{uuid.uuid4().hex}",
+            name=self.name_edit.text().strip(),
+            screen_ids=[screen_id for screen_id, checkbox in self.checkboxes.items() if checkbox.isChecked()],
+        )
+        group.validate()
+        return group
+
+    def accept(self) -> None:  # type: ignore[override]
+        try:
+            group = self.build_group()
+        except ValueError as error:
+            self.message_label.setText(str(error))
+            self.message_label.show()
+            return
+        if not group.screen_ids:
+            self.message_label.setText("Choose at least one screen for the group.")
+            self.message_label.show()
+            return
+        self.message_label.hide()
+        super().accept()
+
+
+class ScreenGroupManagerDialog(QDialog):
+    def __init__(self, groups: list[ScreenGroup], targets: list[UnifiedScreenTarget], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._groups = [ScreenGroup.from_dict(group.to_dict()) for group in groups]
+        self.targets = targets[:]
+        self.setWindowTitle("Screen Groups")
+        self.setModal(True)
+        self.resize(640, 420)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+        title = QLabel("Screen Groups")
+        title.setObjectName("sectionTitle")
+        body = QLabel("Use groups to target a set of screens from schedule slots without selecting each screen one by one.")
+        body.setObjectName("sectionDescription")
+        body.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(body)
+        self.group_list = QListWidget(self)
+        self.group_list.itemDoubleClicked.connect(lambda _item: self.edit_selected_group())
+        layout.addWidget(self.group_list, 1)
+        buttons_row = QHBoxLayout()
+        add_button = QPushButton("Add", self)
+        add_button.clicked.connect(self.add_group)
+        edit_button = QPushButton("Edit", self)
+        edit_button.clicked.connect(self.edit_selected_group)
+        delete_button = QPushButton("Delete", self)
+        delete_button.setProperty("variant", "danger")
+        delete_button.clicked.connect(self.delete_selected_group)
+        buttons_row.addWidget(add_button)
+        buttons_row.addWidget(edit_button)
+        buttons_row.addWidget(delete_button)
+        buttons_row.addStretch(1)
+        layout.addLayout(buttons_row)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Save, parent=self)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.refresh_list()
+
+    def refresh_list(self) -> None:
+        self.group_list.clear()
+        for group in self._groups:
+            item = QListWidgetItem(f"{group.name}\n{len(group.screen_ids)} screen(s)")
+            item.setData(Qt.ItemDataRole.UserRole, group.id)
+            item.setToolTip(", ".join(group.screen_ids))
+            self.group_list.addItem(item)
+        if self.group_list.count():
+            self.group_list.setCurrentRow(0)
+
+    def selected_index(self) -> int:
+        return self.group_list.currentRow()
+
+    def add_group(self) -> None:
+        dialog = ScreenGroupEditorDialog(self.targets, None, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._groups.append(dialog.build_group())
+        self.refresh_list()
+
+    def edit_selected_group(self) -> None:
+        index = self.selected_index()
+        if index < 0 or index >= len(self._groups):
+            return
+        dialog = ScreenGroupEditorDialog(self.targets, self._groups[index], self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._groups[index] = dialog.build_group()
+        self.refresh_list()
+        self.group_list.setCurrentRow(index)
+
+    def delete_selected_group(self) -> None:
+        index = self.selected_index()
+        if index < 0 or index >= len(self._groups):
+            return
+        del self._groups[index]
+        self.refresh_list()
+
+    def screen_groups(self) -> list[ScreenGroup]:
+        return [ScreenGroup.from_dict(group.to_dict()) for group in self._groups]
+
+
 class VideoDropZone(QFrame):
     file_dropped = Signal(str)
 
@@ -3390,6 +3586,7 @@ class MainWindow(QMainWindow):
             validate_unique_browser_bindings(self.configured_screens)
         except ValueError:
             self.configured_screens = []
+        self.screen_groups = [ScreenGroup.from_dict(item.to_dict()) for item in config["screen_groups"]]
         self.schedules = [ScheduleEntry.from_dict(item) for item in config["schedules"]]
         self.selected_monitor_ids = [str(item) for item in config["selected_monitor_ids"]]
         self.video_directory: Path | None = Path(config["video_directory"]).expanduser() if config["video_directory"] else None
@@ -3755,7 +3952,10 @@ class MainWindow(QMainWindow):
         self.refresh_engine_action.triggered.connect(lambda: self.pull_backend_state(initial=False))
         engine_menu.addAction(self.refresh_engine_action)
         screen_menu = self.menuBar().addMenu("Screen")
-        self.screen_target_menu = screen_menu.addMenu("Target Playback Screens")
+        self.screen_target_menu = screen_menu.addMenu("Default Group Screens")
+        self.manage_groups_action = QAction("Manage Screen Groups...", self)
+        self.manage_groups_action.triggered.connect(self.manage_screen_groups)
+        screen_menu.addAction(self.manage_groups_action)
         self.rename_screens_menu = screen_menu.addMenu("Name Screens")
         self.remote_screens_menu = screen_menu.addMenu("Remote LAN Screens")
         refresh_screens_action = QAction("Refresh Screens", self)
@@ -3949,13 +4149,13 @@ class MainWindow(QMainWindow):
         self.end_time_button.setMinimumWidth(96)
         self.end_time_button.clicked.connect(lambda: self.open_time_picker("end"))
         self.day_checkboxes: dict[str, QCheckBox] = {}
-        self.current_form_screen_ids: list[str] = []
+        self.current_form_screen_ids: list[str] = [DEFAULT_GROUP_ID]
         self.schedule_screen_button = QToolButton()
         self.schedule_screen_button.setText("Target Screens")
         self.schedule_screen_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.schedule_screen_menu = QMenu(self)
         self.schedule_screen_button.setMenu(self.schedule_screen_menu)
-        self.schedule_screen_summary_label = ElidedLabel("All selected screens")
+        self.schedule_screen_summary_label = ElidedLabel(DEFAULT_GROUP_NAME)
         self.schedule_screen_summary_label.setObjectName("mutedText")
         days_field = QWidget()
         days_field.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -4300,6 +4500,22 @@ class MainWindow(QMainWindow):
         if response is not None:
             self.set_form_message(f"Configured screens saved ({len(self.configured_screens)}).", "success")
 
+    def all_screen_groups(self) -> list[ScreenGroup]:
+        return combined_screen_groups(self.selected_monitor_ids, self.screen_groups)
+
+    def manage_screen_groups(self, checked: bool = False) -> None:
+        targets = [target for target in self.unified_screen_targets(include_offline=True) if not is_group_target_id(target.id)]
+        dialog = ScreenGroupManagerDialog(self.screen_groups, targets, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        updated_groups = dialog.screen_groups()
+        response = self.call_backend_action(
+            "set_screen_groups",
+            {"screen_groups": [group.to_dict() for group in updated_groups]},
+        )
+        if response is not None:
+            self.set_form_message(f"Screen groups saved ({len(self.screen_groups)}).", "success")
+
     def retry_lan_firewall_setup(self, checked: bool = False) -> None:
         response = self.call_backend_action("retry_firewall_setup")
         if response is None:
@@ -4481,10 +4697,12 @@ class MainWindow(QMainWindow):
         self.rename_screens_menu.clear()
         self.remote_screens_menu.clear()
         self.schedule_screen_menu.clear()
-        apply_all_action = self.schedule_screen_menu.addAction("Apply to All Selected Screens")
-        apply_all_action.setCheckable(True)
-        apply_all_action.setChecked(not self.current_form_screen_ids)
-        apply_all_action.triggered.connect(lambda checked=False: self.set_schedule_screen_targets([]))
+        for group in self.all_screen_groups():
+            group_action = self.schedule_screen_menu.addAction(f"{group.name} ({len(group.screen_ids)})")
+            group_action.setCheckable(True)
+            group_action.setChecked(group.id in self.current_form_screen_ids)
+            group_action.setToolTip(", ".join(screen_label_from_id(screen_id, self.screen_aliases, self.all_screen_groups()) for screen_id in group.screen_ids) or group.name)
+            group_action.triggered.connect(lambda checked=False, group_id=group.id: self.toggle_schedule_screen_selection(group_id))
         self.schedule_screen_menu.addSeparator()
         for index, target in enumerate(self.unified_screen_targets(include_offline=True), start=1):
             label = target.label
@@ -4524,7 +4742,7 @@ class MainWindow(QMainWindow):
         self.call_backend_action("toggle_screen_selection", {"screen_id": screen_id})
 
     def set_schedule_screen_targets(self, screen_ids: list[str]) -> None:
-        self.current_form_screen_ids = screen_ids[:]
+        self.current_form_screen_ids = normalize_schedule_target_ids(screen_ids)
         self.refresh_monitors()
 
     def toggle_schedule_screen_selection(self, screen_id: str) -> None:
@@ -4532,6 +4750,7 @@ class MainWindow(QMainWindow):
             self.current_form_screen_ids.remove(screen_id)
         else:
             self.current_form_screen_ids.append(screen_id)
+        self.current_form_screen_ids = normalize_schedule_target_ids(self.current_form_screen_ids)
         self.refresh_monitors()
 
     def rename_screen_alias(self, screen_id: str) -> None:
@@ -4605,27 +4824,26 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem()
             missing_screen_ids = []
             for screen_id in entry.screen_ids:
+                if is_group_target_id(screen_id):
+                    continue
                 if is_remote_screen_id(screen_id):
                     remote_state = self.remote_screens.get(screen_id)
                     if remote_state is None or not remote_state.get("online"):
                         missing_screen_ids.append(screen_id)
                 elif find_screen_by_id(screen_id) is None:
                     missing_screen_ids.append(screen_id)
-            if not entry.screen_ids:
-                screens_tooltip = "Assigned screens\nAll selected global playback screens."
-            else:
-                assigned_labels = [
-                    friendly_remote_name(screen_id, self.screen_aliases, self.remote_screens.get(screen_id))
-                    if is_remote_screen_id(screen_id)
-                    else screen_label_from_id(screen_id, self.screen_aliases)
-                    for screen_id in entry.screen_ids
-                ]
-                screens_tooltip = "Assigned screens\n" + "\n".join(assigned_labels)
+            assigned_labels = [
+                friendly_remote_name(screen_id, self.screen_aliases, self.remote_screens.get(screen_id))
+                if is_remote_screen_id(screen_id)
+                else screen_label_from_id(screen_id, self.screen_aliases, self.all_screen_groups())
+                for screen_id in entry.screen_ids
+            ]
+            screens_tooltip = "Assigned targets\n" + "\n".join(assigned_labels)
             if missing_screen_ids:
                 missing_labels = [
                     friendly_remote_name(screen_id, self.screen_aliases, self.remote_screens.get(screen_id))
                     if is_remote_screen_id(screen_id)
-                    else screen_label_from_id(screen_id, self.screen_aliases)
+                    else screen_label_from_id(screen_id, self.screen_aliases, self.all_screen_groups())
                     for screen_id in missing_screen_ids
                 ]
                 warning_tooltip = "One or more attached screens are disconnected.\n\n" + "\n".join(missing_labels)
@@ -4667,7 +4885,7 @@ class MainWindow(QMainWindow):
             self.set_time_button_values(QTime.fromString("00:00", "HH:mm"), QTime.fromString("01:00", "HH:mm"))
             for checkbox in self.day_checkboxes.values():
                 checkbox.setChecked(True)
-            self.current_form_screen_ids = []
+            self.current_form_screen_ids = [DEFAULT_GROUP_ID]
             self.current_selected_video_file = ""
             self.update_media_source_summary()
             self.update_schedule_screen_summary()
@@ -4832,6 +5050,9 @@ class MainWindow(QMainWindow):
 
         video_file = selected_video_file
         video_label = selected_video_file if selected_video_file else ""
+        target_ids = normalize_schedule_target_ids(self.current_form_screen_ids)
+        if not target_ids:
+            raise ValueError("Choose at least one target screen or screen group for this schedule.")
 
         return ScheduleEntry(
             id=schedule_id,
@@ -4840,7 +5061,7 @@ class MainWindow(QMainWindow):
             end_time=self.end_time_input.time().toString("HH:mm"),
             video_file=video_file,
             video_label=video_label,
-            screen_ids=self.current_form_screen_ids[:],
+            screen_ids=target_ids,
             days=[day_key for day_key, checkbox in self.day_checkboxes.items() if checkbox.isChecked()],
         )
 
@@ -4872,6 +5093,7 @@ class MainWindow(QMainWindow):
         self.backend_state_version = int(snapshot.get("stateVersion") or self.backend_state_version)
         self.backend_listener.seed_state_version(self.backend_state_version)
         self.configured_screens = parse_configured_screens(snapshot.get("configuredScreens"))
+        self.screen_groups = parse_screen_groups(snapshot.get("screenGroups"))
         schedules_payload = snapshot.get("schedules") or []
         self.schedules = [ScheduleEntry.from_dict(item) for item in schedules_payload if isinstance(item, dict)]
         self.selected_monitor_ids = [str(item) for item in snapshot.get("selectedMonitorIds") or []]
@@ -4945,7 +5167,7 @@ class MainWindow(QMainWindow):
             (
                 entry
                 for screen_id in self.selected_monitor_ids
-                if (entry := active_schedule_for_screen(self.schedules, weekday_index, minute_of_day, screen_id)) is not None
+                if (entry := active_schedule_for_screen(self.schedules, weekday_index, minute_of_day, screen_id, self.all_screen_groups())) is not None
             ),
             active_schedule_for_minute(self.schedules, weekday_index, minute_of_day),
         )
@@ -5005,8 +5227,8 @@ class MainWindow(QMainWindow):
             self.footer_total_primary.setText(f"{total} available")
             self.footer_total_secondary.setText("Local + LAN screens")
         if hasattr(self, "footer_global_primary"):
-            self.footer_global_primary.setText(f"{selected} global")
-            self.footer_global_secondary.setText("Default playback targets")
+            self.footer_global_primary.setText(f"{selected} in default")
+            self.footer_global_secondary.setText("Default playback group")
         total_tooltip = (
             f"Available screens\n"
             f"{len(available_screens())} local screen(s) detected on this computer.\n"
@@ -5020,12 +5242,12 @@ class MainWindow(QMainWindow):
             if widget is not None:
                 widget.setToolTip(total_tooltip)
         if total == 0:
-            global_tooltip = "Global playback screens\nNo screens were detected."
+            global_tooltip = "Default playback group\nNo screens were detected."
         elif selected == 0:
             global_tooltip = (
-                "Global playback screens\n"
-                f"0 of {total} screen(s) are selected as default playback targets.\n"
-                "Schedules can still target LAN screens directly."
+                "Default playback group\n"
+                f"0 of {total} screen(s) are selected for the default playback group.\n"
+                "Schedules can still target individual screens or named groups directly."
             )
         else:
             selected_names = [
@@ -5038,9 +5260,9 @@ class MainWindow(QMainWindow):
                 if is_remote_screen_id(screen_id) or (screen := find_screen_by_id(screen_id)) is not None
             ]
             global_tooltip = (
-                "Global playback screens\n"
-                f"{selected} of {total} screen(s) are selected as default playback targets.\n"
-                "Schedules can still target LAN screens directly.\n\n"
+                "Default playback group\n"
+                f"{selected} of {total} screen(s) are selected for the default playback group.\n"
+                "Schedules can still target individual screens or named groups directly.\n\n"
                 + "\n".join(selected_names)
             )
         for widget in (
@@ -5063,7 +5285,7 @@ class MainWindow(QMainWindow):
     def update_schedule_screen_summary(self) -> None:
         if not hasattr(self, "schedule_screen_summary_label"):
             return
-        target_label = format_screen_targets(self.current_form_screen_ids, self.screen_aliases)
+        target_label = format_screen_targets(self.current_form_screen_ids, self.screen_aliases, self.all_screen_groups())
         self.schedule_screen_summary_label.setText(target_label)
         if hasattr(self, "schedule_screen_button"):
             self.schedule_screen_button.setText(
@@ -5100,7 +5322,7 @@ class MainWindow(QMainWindow):
     def update_selection_summary(self) -> None:
         if not hasattr(self, "schedule_screen_button"):
             return
-        target_label = format_screen_targets(self.current_form_screen_ids, self.screen_aliases)
+        target_label = format_screen_targets(self.current_form_screen_ids, self.screen_aliases, self.all_screen_groups())
         transition_label = TRANSITION_METHODS.get(self.transition_method, "Fade Through Black")
         self.schedule_screen_button.setToolTip(f"Target screens: {target_label}")
         self.transition_selector.setToolTip(f"Transition: {transition_label}")
@@ -5621,6 +5843,7 @@ class ControllerEngine(QObject):
             validate_unique_browser_bindings(self.configured_screens)
         except ValueError:
             self.configured_screens = []
+        self.screen_groups = [ScreenGroup.from_dict(item.to_dict()) for item in config["screen_groups"]]
         self.schedules = [ScheduleEntry.from_dict(item) for item in config["schedules"]]
         self.selected_monitor_ids = [str(item) for item in config["selected_monitor_ids"]]
         self.video_directory: Path | None = Path(config["video_directory"]).expanduser() if config["video_directory"] else None
@@ -5659,6 +5882,7 @@ class ControllerEngine(QObject):
         self.coordinator.set_schedules(self.schedules)
         self.coordinator.set_selected_monitors(self.selected_monitor_ids)
         self.coordinator.set_virtual_screen_ids(self.browser_configured_screen_ids())
+        self.coordinator.set_screen_groups(self.all_screen_groups())
         self.coordinator.set_video_directory(self.video_directory)
         self.coordinator.set_transition_method(self.transition_method)
         self.remote_server = LanRemoteServer()
@@ -5685,6 +5909,9 @@ class ControllerEngine(QObject):
 
     def browser_configured_screen_ids(self) -> set[str]:
         return configured_browser_screen_ids(self.configured_screens)
+
+    def all_screen_groups(self) -> list[ScreenGroup]:
+        return combined_screen_groups(self.selected_monitor_ids, self.screen_groups)
 
     def on_playback_state_changed(self, paused: bool, window_count: int) -> None:
         self.playback_paused = paused
@@ -5759,6 +5986,7 @@ class ControllerEngine(QObject):
     def persist_state(self) -> None:
         save_config(
             self.configured_screens,
+            self.screen_groups,
             self.selected_monitor_ids,
             str(self.video_directory) if self.video_directory is not None else "",
             self.screen_aliases,
@@ -5908,10 +6136,8 @@ class ControllerEngine(QObject):
     def build_remote_server_commands(self) -> dict[str, dict[str, Any]]:
         commands: dict[str, dict[str, Any]] = {}
         command_snapshots = self.coordinator.command_snapshots()
-        commands.update(resolve_browser_commands(self.configured_screens, self.remote_screens, command_snapshots))
+        prepared_commands: dict[str, dict[str, Any]] = {}
         for screen_id, command in command_snapshots.items():
-            if screen_id in self.browser_configured_screen_ids():
-                continue
             media_path = Path(str(command.get("path") or "")) if command.get("path") else None
             media_url = ""
             if media_path is not None:
@@ -5920,7 +6146,7 @@ class ControllerEngine(QObject):
                     media_url = f"/media/{quote(relative_path, safe='/')}"
                 elif media_path.exists():
                     media_url = f"/api/media-file?path={quote(str(media_path))}"
-            commands[screen_id] = {
+            prepared_commands[screen_id] = {
                 "screenId": screen_id,
                 "version": int(command.get("version") or 0),
                 "type": str(command.get("type") or "clear"),
@@ -5936,6 +6162,11 @@ class ControllerEngine(QObject):
                 "transition": str(command.get("transition") or "fade_black"),
                 "paused": bool(command.get("paused")),
             }
+        commands.update(resolve_browser_commands(self.configured_screens, self.remote_screens, prepared_commands))
+        for screen_id, command in prepared_commands.items():
+            if screen_id in self.browser_configured_screen_ids():
+                continue
+            commands[screen_id] = command
         return commands
 
     def sync_remote_server_commands(self) -> None:
@@ -6024,7 +6255,7 @@ class ControllerEngine(QObject):
             (
                 entry
                 for screen_id in self.selected_monitor_ids
-                if (entry := active_schedule_for_screen(self.schedules, weekday_index, minute_of_day, screen_id)) is not None
+                if (entry := active_schedule_for_screen(self.schedules, weekday_index, minute_of_day, screen_id, self.all_screen_groups())) is not None
             ),
             active_schedule_for_minute(self.schedules, weekday_index, minute_of_day),
         )
@@ -6061,6 +6292,7 @@ class ControllerEngine(QObject):
         return {
             "stateVersion": self._state_version,
             "configuredScreens": [screen.to_dict() for screen in self.configured_screens],
+            "screenGroups": [group.to_dict() for group in self.screen_groups],
             "selectedMonitorIds": self.selected_monitor_ids,
             "videoDirectory": str(self.video_directory) if self.video_directory is not None else "",
             "screenAliases": self.screen_aliases,
@@ -6105,6 +6337,7 @@ class ControllerEngine(QObject):
                 else:
                     self.selected_monitor_ids.append(screen_id)
                 self.coordinator.set_selected_monitors(self.selected_monitor_ids)
+                self.coordinator.set_screen_groups(self.all_screen_groups())
                 self.persist_state()
         elif action == "rename_screen_alias":
             screen_id = str(payload.get("screen_id") or "")
@@ -6144,7 +6377,7 @@ class ControllerEngine(QObject):
             self.coordinator.set_schedules(self.schedules)
             self.coordinator.set_selected_monitors(self.selected_monitor_ids)
             if not self.coordinator.has_launch_targets():
-                raise ValueError("Choose at least one target screen in Global Screens or within a schedule before launching playback.")
+                raise ValueError("Choose at least one screen in the default playback group or target a screen/group within a schedule before launching playback.")
             self.coordinator.launch_windows()
             self.sync_playback_outputs()
         elif action == "toggle_pause":
@@ -6163,6 +6396,10 @@ class ControllerEngine(QObject):
             validate_unique_browser_bindings(self.configured_screens)
             self.screen_aliases.update(configured_screen_name_map(self.configured_screens))
             self.coordinator.set_virtual_screen_ids(self.browser_configured_screen_ids())
+            self.persist_state()
+        elif action == "set_screen_groups":
+            self.screen_groups = validate_screen_groups(payload.get("screen_groups"))
+            self.coordinator.set_screen_groups(self.all_screen_groups())
             self.persist_state()
         elif action == "save_schedule":
             raw_schedule = payload.get("schedule")
