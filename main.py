@@ -71,6 +71,20 @@ from browser_screen_bindings import (
     resolve_browser_commands,
     validate_unique_browser_bindings,
 )
+from dlna_support import (
+    DLNA_AVTRANSPORT_SERVICE,
+    DLNA_BINDING_KEY,
+    DlnaDevice,
+    build_didl_lite_metadata,
+    build_soap_envelope,
+    dlna_binding_usn,
+    dlna_target_status_detail,
+    is_dlna_media_renderer,
+    parse_device_description,
+    parse_ssdp_response,
+    resolve_dlna_commands,
+    validate_unique_dlna_bindings,
+)
 from screen_protocols import (
     CAPABILITY_LABELS,
     SCREEN_CAPABILITIES,
@@ -1017,6 +1031,168 @@ def configured_screen_summary(screen: ConfiguredScreen) -> str:
 
 def configured_screen_name_map(configured_screens: list[ConfiguredScreen]) -> dict[str, str]:
     return {screen.id: screen.name for screen in configured_screens if screen.name.strip()}
+
+
+class DlnaAdapter:
+    def __init__(self, server_port: int = LAN_SERVER_PORT) -> None:
+        self.server_port = server_port
+        self._lock = threading.RLock()
+        self._devices: dict[str, dict[str, Any]] = {}
+        self._change_callback = None
+        self._last_command_versions: dict[str, int] = {}
+
+    def set_change_callback(self, callback) -> None:
+        self._change_callback = callback
+
+    def _notify_change(self) -> None:
+        callback = self._change_callback
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                return
+
+    def devices_snapshot(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [dict(item) for item in sorted(self._devices.values(), key=lambda device: str(device.get("friendly_name") or device.get("usn") or "").lower())]
+
+    def devices_by_usn(self) -> dict[str, dict[str, Any]]:
+        with self._lock:
+            return {usn: dict(device) for usn, device in self._devices.items()}
+
+    def refresh_discovery(self, timeout_seconds: float = 1.2) -> None:
+        discovered: dict[str, dict[str, Any]] = {}
+        search_targets = [
+            "urn:schemas-upnp-org:device:MediaRenderer:1",
+            "ssdp:all",
+        ]
+        for search_target in search_targets:
+            for payload, sender_ip in self._perform_msearch(search_target, timeout_seconds):
+                headers = parse_ssdp_response(payload)
+                if not headers or not is_dlna_media_renderer(headers):
+                    continue
+                location = str(headers.get("LOCATION") or "").strip()
+                if not location:
+                    continue
+                device = self._fetch_device_description(location, sender_ip)
+                if device is None:
+                    continue
+                discovered[device.usn] = device.to_dict()
+        with self._lock:
+            previous = json.dumps(self._devices, sort_keys=True)
+            current = json.dumps(discovered, sort_keys=True)
+            self._devices = discovered
+        if previous != current:
+            self._notify_change()
+
+    def _perform_msearch(self, search_target: str, timeout_seconds: float) -> list[tuple[bytes, str]]:
+        request = (
+            "M-SEARCH * HTTP/1.1\r\n"
+            "HOST: 239.255.255.250:1900\r\n"
+            'MAN: "ssdp:discover"\r\n'
+            "MX: 1\r\n"
+            f"ST: {search_target}\r\n\r\n"
+        ).encode("utf-8")
+        responses: list[tuple[bytes, str]] = []
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.settimeout(timeout_seconds)
+            sock.sendto(request, ("239.255.255.250", 1900))
+            deadline = time.monotonic() + timeout_seconds
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                sock.settimeout(remaining)
+                try:
+                    payload, address = sock.recvfrom(65535)
+                except socket.timeout:
+                    break
+                responses.append((payload, address[0] if address else ""))
+        except OSError:
+            return []
+        finally:
+            try:
+                if sock is not None:
+                    sock.close()
+            except Exception:
+                pass
+        return responses
+
+    def _fetch_device_description(self, location_url: str, sender_ip: str) -> DlnaDevice | None:
+        try:
+            request = Request(location_url, headers={"Accept": "text/xml, application/xml"}, method="GET")
+            with urlopen(request, timeout=2.5) as response:
+                xml_text = response.read().decode("utf-8", errors="ignore")
+        except Exception:
+            return None
+        return parse_device_description(location_url, xml_text, sender_ip)
+
+    def apply_commands(self, commands: dict[str, dict[str, Any]]) -> None:
+        for usn, command in commands.items():
+            version = int(command.get("version") or 0)
+            if self._last_command_versions.get(usn) == version:
+                continue
+            self._last_command_versions[usn] = version
+            threading.Thread(
+                target=self._apply_command_safe,
+                args=(usn, dict(command)),
+                name=f"dlna-command-{version}",
+                daemon=True,
+            ).start()
+
+    def _apply_command_safe(self, usn: str, command: dict[str, Any]) -> None:
+        try:
+            self._apply_command(usn, command)
+        except Exception as error:  # noqa: BLE001
+            append_engine_startup_log(f"DLNA command failed for {usn}: {error}")
+
+    def _apply_command(self, usn: str, command: dict[str, Any]) -> None:
+        devices = self.devices_by_usn()
+        device_state = devices.get(usn)
+        if device_state is None:
+            return
+        device = DlnaDevice.from_dict(device_state)
+        command_type = str(command.get("type") or "clear")
+        media_url = str(command.get("mediaUrl") or "").strip()
+        if command_type != "play" or not media_url:
+            self._soap_action(device.av_transport_url, DLNA_AVTRANSPORT_SERVICE, "Stop", {"InstanceID": 0})
+            return
+        label = str(command.get("label") or "Background Screen Media")
+        media_kind = str(command.get("mediaKind") or "").strip().lower()
+        mime_type = "image/jpeg" if media_kind == "image" else "video/mp4"
+        metadata = build_didl_lite_metadata(label, media_url, mime_type)
+        self._soap_action(
+            device.av_transport_url,
+            DLNA_AVTRANSPORT_SERVICE,
+            "SetAVTransportURI",
+            {
+                "InstanceID": 0,
+                "CurrentURI": media_url,
+                "CurrentURIMetaData": metadata,
+            },
+        )
+        if bool(command.get("paused")):
+            self._soap_action(device.av_transport_url, DLNA_AVTRANSPORT_SERVICE, "Pause", {"InstanceID": 0})
+        else:
+            self._soap_action(device.av_transport_url, DLNA_AVTRANSPORT_SERVICE, "Play", {"InstanceID": 0, "Speed": 1})
+
+    def _soap_action(self, control_url: str, service_type: str, action: str, arguments: dict[str, Any]) -> None:
+        body = build_soap_envelope(service_type, action, arguments).encode("utf-8")
+        request = Request(
+            control_url,
+            data=body,
+            headers={
+                "Content-Type": 'text/xml; charset="utf-8"',
+                "SOAPAction": f'"{service_type}#{action}"',
+                "Content-Length": str(len(body)),
+            },
+            method="POST",
+        )
+        with urlopen(request, timeout=4.0) as response:
+            response.read()
 
 
 class LanRemoteServer:
@@ -3091,11 +3267,13 @@ class ConfiguredScreenEditorDialog(QDialog):
         self,
         screen: ConfiguredScreen | None = None,
         remote_screens: dict[str, dict[str, Any]] | None = None,
+        dlna_devices: dict[str, dict[str, Any]] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.screen = screen
         self.remote_screens = {str(key): dict(value) for key, value in (remote_screens or {}).items()}
+        self.dlna_devices = {str(key): dict(value) for key, value in (dlna_devices or {}).items()}
         self.setWindowTitle("Configured Screen")
         self.setModal(True)
         self.resize(520, 420)
@@ -3127,9 +3305,9 @@ class ConfiguredScreenEditorDialog(QDialog):
         form.addRow("Binding", self.binding_edit)
         layout.addLayout(form)
 
-        self.browser_binding_selector = QComboBox(self)
-        self.browser_binding_selector.currentIndexChanged.connect(self.on_browser_binding_changed)
-        layout.addWidget(self.browser_binding_selector)
+        self.binding_selector = QComboBox(self)
+        self.binding_selector.currentIndexChanged.connect(self.on_binding_changed)
+        layout.addWidget(self.binding_selector)
 
         capability_title = QLabel("Capabilities")
         capability_title.setObjectName("sectionDescription")
@@ -3157,7 +3335,8 @@ class ConfiguredScreenEditorDialog(QDialog):
 
         if screen is not None:
             self.name_edit.setText(screen.name)
-            self.binding_edit.setText(browser_binding_remote_id(screen) or screen.binding.get("value", ""))
+            initial_binding = browser_binding_remote_id(screen) or dlna_binding_usn(screen) or screen.binding.get("value", "")
+            self.binding_edit.setText(initial_binding)
             selected_index = self.transport_selector.findData(screen.transport)
             if selected_index >= 0:
                 self.transport_selector.setCurrentIndex(selected_index)
@@ -3180,43 +3359,60 @@ class ConfiguredScreenEditorDialog(QDialog):
                 checkbox.setChecked(False)
             elif should_seed_defaults:
                 checkbox.setChecked(True)
-        self.refresh_browser_binding_selector()
+        self.refresh_transport_binding_selector()
 
-    def refresh_browser_binding_selector(self) -> None:
-        is_browser = str(self.transport_selector.currentData() or "") == "browser"
-        self.browser_binding_selector.setVisible(is_browser)
-        if not is_browser:
+    def refresh_transport_binding_selector(self) -> None:
+        transport = str(self.transport_selector.currentData() or "")
+        self.binding_selector.setVisible(transport in {"browser", "dlna"})
+        if transport not in {"browser", "dlna"}:
             return
-        self.browser_binding_selector.blockSignals(True)
-        self.browser_binding_selector.clear()
-        self.browser_binding_selector.addItem("Bind manually or choose a connected browser receiver", "")
-        for screen_id, state in sorted(self.remote_screens.items(), key=lambda item: friendly_remote_name(item[0], {}, item[1]).lower()):
-            online_text = "online" if state.get("online") else "offline"
-            label = f"{friendly_remote_name(screen_id, {}, state)} ({online_text})"
-            self.browser_binding_selector.addItem(label, screen_id)
+        self.binding_selector.blockSignals(True)
+        self.binding_selector.clear()
+        if transport == "browser":
+            self.binding_selector.addItem("Bind manually or choose a connected browser receiver", "")
+            for screen_id, state in sorted(self.remote_screens.items(), key=lambda item: friendly_remote_name(item[0], {}, item[1]).lower()):
+                online_text = "online" if state.get("online") else "offline"
+                label = f"{friendly_remote_name(screen_id, {}, state)} ({online_text})"
+                self.binding_selector.addItem(label, screen_id)
+        elif transport == "dlna":
+            self.binding_selector.addItem("Bind manually or choose a discovered DLNA renderer", "")
+            for usn, device in sorted(self.dlna_devices.items(), key=lambda item: str(item[1].get("friendly_name") or item[0]).lower()):
+                name = str(device.get("friendly_name") or usn)
+                ip = str(device.get("ip") or "")
+                label = f"{name} ({ip})" if ip else name
+                self.binding_selector.addItem(label, usn)
         current_binding = self.binding_edit.text().strip()
         if current_binding:
-            index = self.browser_binding_selector.findData(current_binding)
+            index = self.binding_selector.findData(current_binding)
             if index >= 0:
-                self.browser_binding_selector.setCurrentIndex(index)
-        self.browser_binding_selector.blockSignals(False)
+                self.binding_selector.setCurrentIndex(index)
+        self.binding_selector.blockSignals(False)
 
-    def on_browser_binding_changed(self) -> None:
-        remote_id = str(self.browser_binding_selector.currentData() or "")
-        if remote_id:
-            self.binding_edit.setText(remote_id)
+    def on_binding_changed(self) -> None:
+        binding_value = str(self.binding_selector.currentData() or "")
+        if binding_value:
+            self.binding_edit.setText(binding_value)
 
     def selected_capabilities(self) -> list[str]:
         return [capability for capability, checkbox in self.capability_checks.items() if checkbox.isChecked()]
 
     def build_screen(self) -> ConfiguredScreen:
         binding_value = self.binding_edit.text().strip()
+        binding: dict[str, str] = {}
+        transport = str(self.transport_selector.currentData() or "")
+        if binding_value:
+            if transport == "browser":
+                binding = {BROWSER_BINDING_KEY: binding_value}
+            elif transport == "dlna":
+                binding = {DLNA_BINDING_KEY: binding_value}
+            else:
+                binding = {"value": binding_value}
         screen = ConfiguredScreen(
             id=self.screen.id if self.screen is not None else uuid.uuid4().hex,
             name=self.name_edit.text().strip(),
-            transport=str(self.transport_selector.currentData() or ""),
+            transport=transport,
             capabilities=self.selected_capabilities(),
-            binding={BROWSER_BINDING_KEY: binding_value} if binding_value else {},
+            binding=binding,
         )
         screen.validate()
         return screen
@@ -3237,11 +3433,13 @@ class ConfiguredScreenManagerDialog(QDialog):
         self,
         screens: list[ConfiguredScreen],
         remote_screens: dict[str, dict[str, Any]] | None = None,
+        dlna_devices: dict[str, dict[str, Any]] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._screens = [ConfiguredScreen.from_dict(screen.to_dict()) for screen in screens]
         self.remote_screens = {str(key): dict(value) for key, value in (remote_screens or {}).items()}
+        self.dlna_devices = {str(key): dict(value) for key, value in (dlna_devices or {}).items()}
         self.setWindowTitle("Configured Screens")
         self.setModal(True)
         self.resize(720, 440)
@@ -3298,7 +3496,7 @@ class ConfiguredScreenManagerDialog(QDialog):
         return self.screen_list.currentRow()
 
     def add_screen(self) -> None:
-        dialog = ConfiguredScreenEditorDialog(remote_screens=self.remote_screens, parent=self)
+        dialog = ConfiguredScreenEditorDialog(remote_screens=self.remote_screens, dlna_devices=self.dlna_devices, parent=self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self._screens.append(dialog.build_screen())
@@ -3308,7 +3506,7 @@ class ConfiguredScreenManagerDialog(QDialog):
         index = self.selected_index()
         if index < 0 or index >= len(self._screens):
             return
-        dialog = ConfiguredScreenEditorDialog(self._screens[index], self.remote_screens, self)
+        dialog = ConfiguredScreenEditorDialog(self._screens[index], self.remote_screens, self.dlna_devices, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self._screens[index] = dialog.build_screen()
@@ -3584,6 +3782,7 @@ class MainWindow(QMainWindow):
         self.configured_screens = [ConfiguredScreen.from_dict(item.to_dict()) for item in config["configured_screens"]]
         try:
             validate_unique_browser_bindings(self.configured_screens)
+            validate_unique_dlna_bindings(self.configured_screens)
         except ValueError:
             self.configured_screens = []
         self.screen_groups = [ScreenGroup.from_dict(item.to_dict()) for item in config["screen_groups"]]
@@ -3607,6 +3806,7 @@ class MainWindow(QMainWindow):
         self._last_layout_width = 0
         self.current_active_screen_count = 0
         self.remote_screens: dict[str, dict[str, Any]] = {}
+        self.dlna_devices: dict[str, dict[str, Any]] = {}
         self.backend_network_snapshot: dict[str, Any] = {}
         self.backend_online = False
         self.backend_state_version = 0
@@ -3948,6 +4148,9 @@ class MainWindow(QMainWindow):
         self.retry_firewall_action = QAction("Retry LAN Firewall Setup", self)
         self.retry_firewall_action.triggered.connect(self.retry_lan_firewall_setup)
         engine_menu.addAction(self.retry_firewall_action)
+        self.refresh_dlna_action = QAction("Refresh DLNA Discovery", self)
+        self.refresh_dlna_action.triggered.connect(self.refresh_dlna_discovery)
+        engine_menu.addAction(self.refresh_dlna_action)
         self.refresh_engine_action = QAction("Refresh Engine Status", self)
         self.refresh_engine_action.triggered.connect(lambda: self.pull_backend_state(initial=False))
         engine_menu.addAction(self.refresh_engine_action)
@@ -3958,6 +4161,7 @@ class MainWindow(QMainWindow):
         screen_menu.addAction(self.manage_groups_action)
         self.rename_screens_menu = screen_menu.addMenu("Name Screens")
         self.remote_screens_menu = screen_menu.addMenu("Remote LAN Screens")
+        self.dlna_screens_menu = screen_menu.addMenu("Discovered DLNA Devices")
         refresh_screens_action = QAction("Refresh Screens", self)
         refresh_screens_action.triggered.connect(self.refresh_monitors)
         screen_menu.addAction(refresh_screens_action)
@@ -4489,7 +4693,7 @@ class MainWindow(QMainWindow):
             self.set_form_message("Background engine was not running or could not be stopped.", "error")
 
     def manage_configured_screens(self, checked: bool = False) -> None:
-        dialog = ConfiguredScreenManagerDialog(self.configured_screens, self.remote_screens, self)
+        dialog = ConfiguredScreenManagerDialog(self.configured_screens, self.remote_screens, self.dlna_devices, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         updated_screens = dialog.configured_screens()
@@ -4531,6 +4735,11 @@ class MainWindow(QMainWindow):
             self.set_form_message(firewall_warnings[0], "error")
         else:
             self.set_form_message("LAN firewall check completed. Review the LAN panel warnings if screens still cannot connect.", "success")
+
+    def refresh_dlna_discovery(self, checked: bool = False) -> None:
+        response = self.call_backend_action("refresh_dlna_discovery")
+        if response is not None:
+            self.set_form_message(f"DLNA discovery refreshed ({len(self.dlna_devices)} device(s) found).", "success")
 
     def handle_toggle_pause(self, checked: bool = False) -> None:
         self.call_backend_action("toggle_pause")
@@ -4605,6 +4814,20 @@ class MainWindow(QMainWindow):
             )
         for screen in sorted((item for item in self.configured_screens if item.transport == "browser"), key=lambda item: item.name.lower()):
             online, detail, warning = browser_target_status_detail(screen, self.remote_screens)
+            if not include_offline and not online:
+                continue
+            targets.append(
+                UnifiedScreenTarget(
+                    id=screen.id,
+                    label=screen.name,
+                    kind="remote",
+                    online=online,
+                    detail=detail,
+                    warning=warning,
+                )
+            )
+        for screen in sorted((item for item in self.configured_screens if item.transport == "dlna"), key=lambda item: item.name.lower()):
+            online, detail, warning = dlna_target_status_detail(screen, self.dlna_devices)
             if not include_offline and not online:
                 continue
             targets.append(
@@ -4696,7 +4919,9 @@ class MainWindow(QMainWindow):
         self.screen_target_menu.clear()
         self.rename_screens_menu.clear()
         self.remote_screens_menu.clear()
+        self.dlna_screens_menu.clear()
         self.schedule_screen_menu.clear()
+        configured_transport_by_id = {screen.id: screen.transport for screen in self.configured_screens}
         for group in self.all_screen_groups():
             group_action = self.schedule_screen_menu.addAction(f"{group.name} ({len(group.screen_ids)})")
             group_action.setCheckable(True)
@@ -4712,7 +4937,8 @@ class MainWindow(QMainWindow):
                     geometry = local_screen.geometry()
                     label = f"{target.label} ({geometry.width()}x{geometry.height()})"
             else:
-                label = f"{target.label} (Browser{' • offline' if not target.online else ''})"
+                transport_label = TRANSPORT_LABELS.get(configured_transport_by_id.get(target.id, "browser"), "Remote")
+                label = f"{target.label} ({transport_label}{' • offline' if not target.online else ''})"
             action = self.screen_target_menu.addAction(label)
             action.setCheckable(True)
             action.setChecked(target.id in self.selected_monitor_ids)
@@ -4734,6 +4960,13 @@ class MainWindow(QMainWindow):
             if int(state.get("width") or 0) and int(state.get("height") or 0):
                 detail = f"{detail} • {int(state.get('width') or 0)}x{int(state.get('height') or 0)}".strip(" •")
             remote_action.setToolTip(detail or screen_id)
+        for usn, device in sorted(self.dlna_devices.items(), key=lambda item: str(item[1].get("friendly_name") or item[0]).lower()):
+            name = str(device.get("friendly_name") or usn)
+            ip = str(device.get("ip") or "")
+            detail = f"DLNA renderer • {ip}" if ip else "DLNA renderer"
+            action = self.dlna_screens_menu.addAction(name)
+            action.setEnabled(False)
+            action.setToolTip(detail)
         self.update_monitor_summary()
         self.update_schedule_screen_summary()
         self.refresh_schedule_list()
@@ -5114,6 +5347,11 @@ class MainWindow(QMainWindow):
             str(item.get("screen_id")): item
             for item in snapshot.get("remoteScreens") or []
             if isinstance(item, dict) and item.get("screen_id")
+        }
+        self.dlna_devices = {
+            str(item.get("usn")): item
+            for item in snapshot.get("dlnaDevices") or []
+            if isinstance(item, dict) and item.get("usn")
         }
         self.backend_network_snapshot = dict(snapshot.get("network") or {})
         library = snapshot.get("library") or {}
@@ -5841,6 +6079,7 @@ class ControllerEngine(QObject):
         self.configured_screens = [ConfiguredScreen.from_dict(item.to_dict()) for item in config["configured_screens"]]
         try:
             validate_unique_browser_bindings(self.configured_screens)
+            validate_unique_dlna_bindings(self.configured_screens)
         except ValueError:
             self.configured_screens = []
         self.screen_groups = [ScreenGroup.from_dict(item.to_dict()) for item in config["screen_groups"]]
@@ -5855,6 +6094,7 @@ class ControllerEngine(QObject):
         self.run_at_startup = bool(config["run_at_startup"])
         self.available_videos: list[Path] = []
         self.remote_screens: dict[str, dict[str, Any]] = {}
+        self.dlna_devices: dict[str, dict[str, Any]] = {}
         self.status_clock_label, self.status_active_label = current_uk_time_status(self.schedules)
         self.local_window_count = 0
         self.local_playback_workers: dict[str, subprocess.Popen] = {}
@@ -5871,6 +6111,9 @@ class ControllerEngine(QObject):
         self.remote_refresh_timer = QTimer(self)
         self.remote_refresh_timer.setInterval(1500)
         self.remote_refresh_timer.timeout.connect(self.refresh_remote_screens)
+        self.dlna_refresh_timer = QTimer(self)
+        self.dlna_refresh_timer.setInterval(15000)
+        self.dlna_refresh_timer.timeout.connect(self.refresh_dlna_devices)
         self.firewall_check_timer = QTimer(self)
         self.firewall_check_timer.setInterval(60000)
         self.firewall_check_timer.timeout.connect(self.ensure_firewall_access)
@@ -5889,26 +6132,39 @@ class ControllerEngine(QObject):
         self.remote_server.set_change_callback(self.remote_server_changed.emit)
         self.remote_server.set_media_root(self.video_directory)
         self.remote_server.start()
+        self.dlna_adapter = DlnaAdapter()
+        self.dlna_adapter.set_change_callback(self.on_dlna_devices_changed)
         self.control_server = EngineControlServer(self)
         self.control_server.start()
         self.apply_video_directory_watch()
         self.refresh_video_library()
         self.sync_playback_outputs()
         self.refresh_remote_screens()
+        self.refresh_dlna_devices()
         self.ensure_firewall_access(force_retry=False)
         self.sync_startup_registration()
         self.remote_refresh_timer.start()
+        self.dlna_refresh_timer.start()
         self.firewall_check_timer.start()
 
     def on_status_changed(self, clock_label: str, active_label: str) -> None:
         self.status_clock_label = clock_label
         self.status_active_label = active_label
 
+    def on_dlna_devices_changed(self) -> None:
+        self.refresh_dlna_devices(notify_only=True)
+
     def browser_configured_screens(self) -> list[ConfiguredScreen]:
         return [screen for screen in self.configured_screens if screen.transport == "browser"]
 
     def browser_configured_screen_ids(self) -> set[str]:
         return configured_browser_screen_ids(self.configured_screens)
+
+    def dlna_configured_screens(self) -> list[ConfiguredScreen]:
+        return [screen for screen in self.configured_screens if screen.transport == "dlna"]
+
+    def dlna_configured_screen_ids(self) -> set[str]:
+        return {screen.id for screen in self.dlna_configured_screens()}
 
     def all_screen_groups(self) -> list[ScreenGroup]:
         return combined_screen_groups(self.selected_monitor_ids, self.screen_groups)
@@ -6093,6 +6349,19 @@ class ControllerEngine(QObject):
         if current_snapshot != previous_snapshot:
             self.notify_state_changed()
 
+    def refresh_dlna_devices(self, notify_only: bool = False) -> None:
+        previous = json.dumps(self.dlna_devices, sort_keys=True)
+        if not notify_only:
+            self.dlna_adapter.refresh_discovery()
+        self.dlna_devices = {
+            str(item.get("usn")): item
+            for item in self.dlna_adapter.devices_snapshot()
+            if isinstance(item, dict) and item.get("usn")
+        }
+        current = json.dumps(self.dlna_devices, sort_keys=True)
+        if current != previous:
+            self.notify_state_changed()
+
     def ensure_firewall_access(self, force_retry: bool = False) -> None:
         before_warning = self.remote_server.network_snapshot().get("warnings") or []
         before_configured = bool(self.remote_server.network_snapshot().get("firewallConfigured"))
@@ -6119,6 +6388,20 @@ class ControllerEngine(QObject):
             )
         for screen in sorted(self.browser_configured_screens(), key=lambda item: item.name.lower()):
             online, detail, warning = browser_target_status_detail(screen, self.remote_screens)
+            if not include_offline and not online:
+                continue
+            targets.append(
+                UnifiedScreenTarget(
+                    id=screen.id,
+                    label=screen.name,
+                    kind="remote",
+                    online=online,
+                    detail=detail,
+                    warning=warning,
+                )
+            )
+        for screen in sorted(self.dlna_configured_screens(), key=lambda item: item.name.lower()):
+            online, detail, warning = dlna_target_status_detail(screen, self.dlna_devices)
             if not include_offline and not online:
                 continue
             targets.append(
@@ -6177,8 +6460,25 @@ class ControllerEngine(QObject):
         return sorted(
             screen_id
             for screen_id in self.coordinator.all_active_screen_ids()
-            if not is_remote_screen_id(screen_id) and screen_id not in self.browser_configured_screen_ids()
+            if (
+                not is_remote_screen_id(screen_id)
+                and screen_id not in self.browser_configured_screen_ids()
+                and screen_id not in self.dlna_configured_screen_ids()
+            )
         )
+
+    def absolute_controller_media_url(self, media_url: str) -> str:
+        if not media_url:
+            return ""
+        if media_url.startswith("http://") or media_url.startswith("https://"):
+            return media_url
+        snapshot = self.remote_server.network_snapshot()
+        preferred_ip = str(snapshot.get("preferred_ip") or "").strip()
+        hostname = str(snapshot.get("hostname") or "").strip()
+        host = preferred_ip or hostname
+        if not host:
+            return ""
+        return f"http://{host}:{LAN_SERVER_PORT}{media_url}"
 
     def spawn_local_playback_worker(self, screen_id: str) -> None:
         if screen_id in self.local_playback_workers:
@@ -6231,7 +6531,13 @@ class ControllerEngine(QObject):
         self.local_window_count = len(self.local_playback_workers)
 
     def sync_playback_outputs(self) -> None:
-        self.sync_remote_server_commands()
+        prepared_commands = self.build_remote_server_commands()
+        self.remote_server.set_media_root(self.video_directory)
+        self.remote_server.set_commands(prepared_commands)
+        dlna_commands = resolve_dlna_commands(self.configured_screens, self.dlna_devices, prepared_commands)
+        for command in dlna_commands.values():
+            command["mediaUrl"] = self.absolute_controller_media_url(str(command.get("mediaUrl") or ""))
+        self.dlna_adapter.apply_commands(dlna_commands)
         self.sync_local_playback_workers()
         self.notify_state_changed()
 
@@ -6306,6 +6612,7 @@ class ControllerEngine(QObject):
                 "indexedCount": len(self.available_videos),
             },
             "remoteScreens": self.remote_server.remote_screens_snapshot(),
+            "dlnaDevices": self.dlna_adapter.devices_snapshot(),
             "network": self.remote_server.network_snapshot(),
             "screens": [
                 {
@@ -6387,6 +6694,8 @@ class ControllerEngine(QObject):
             self.sync_playback_outputs()
         elif action == "retry_firewall_setup":
             self.ensure_firewall_access(force_retry=True)
+        elif action == "refresh_dlna_discovery":
+            self.refresh_dlna_devices()
         elif action == "set_run_at_startup":
             self.run_at_startup = bool(payload.get("value"))
             self.sync_startup_registration()
@@ -6394,6 +6703,7 @@ class ControllerEngine(QObject):
         elif action == "set_configured_screens":
             self.configured_screens = validate_configured_screens(payload.get("configured_screens"))
             validate_unique_browser_bindings(self.configured_screens)
+            validate_unique_dlna_bindings(self.configured_screens)
             self.screen_aliases.update(configured_screen_name_map(self.configured_screens))
             self.coordinator.set_virtual_screen_ids(self.browser_configured_screen_ids())
             self.persist_state()
@@ -6440,6 +6750,7 @@ class ControllerEngine(QObject):
     def shutdown(self) -> None:
         self.folder_refresh_timer.stop()
         self.remote_refresh_timer.stop()
+        self.dlna_refresh_timer.stop()
         self.firewall_check_timer.stop()
         watched_paths = self.folder_watcher.directories()
         if watched_paths:
