@@ -5,14 +5,12 @@ from dataclasses import dataclass, field
 from typing import Iterable, Mapping
 
 
-SCREEN_TRANSPORTS = ("local_hdmi", "browser", "dlna", "miracast")
+SCREEN_TRANSPORTS = ("local_hdmi", "browser")
 SCREEN_CAPABILITIES = ("static_media", "playlist", "live_view", "remote_input", "sync_playback")
 
 TRANSPORT_LABELS = {
     "local_hdmi": "Local HDMI",
     "browser": "Browser Receiver",
-    "dlna": "DLNA",
-    "miracast": "Miracast",
 }
 
 CAPABILITY_LABELS = {
@@ -26,8 +24,6 @@ CAPABILITY_LABELS = {
 TRANSPORT_CAPABILITY_MATRIX = {
     "local_hdmi": frozenset({"static_media", "playlist", "live_view", "sync_playback"}),
     "browser": frozenset({"static_media", "playlist", "live_view", "sync_playback"}),
-    "dlna": frozenset({"static_media", "playlist"}),
-    "miracast": frozenset({"live_view"}),
 }
 
 
@@ -41,8 +37,6 @@ def normalize_transport(value: object) -> str:
         "browser": "browser",
         "browser_receiver": "browser",
         "web": "browser",
-        "dlna": "dlna",
-        "miracast": "miracast",
     }
     return aliases.get(cleaned, "")
 

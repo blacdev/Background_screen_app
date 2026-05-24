@@ -1,0 +1,10 @@
+# Runtime dependencies
+PySide6
+
+# Test/development dependencies
+pytest
+
+# Packaging/build dependencies
+pyinstaller
+
+tzdata

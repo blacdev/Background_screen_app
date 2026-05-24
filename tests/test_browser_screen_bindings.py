@@ -43,8 +43,8 @@ def test_browser_binding_remote_id_ignores_non_browser_screens() -> None:
     screen = ConfiguredScreen(
         id="screen-2",
         name="Projector",
-        transport="dlna",
-        capabilities=list(supported_capabilities("dlna")),
+        transport="local_hdmi",
+        capabilities=list(supported_capabilities("local_hdmi")),
         binding={BROWSER_BINDING_KEY: "remote:abc"},
     )
     assert browser_binding_remote_id(screen) == ""
@@ -56,8 +56,8 @@ def test_configured_browser_screen_ids_returns_only_browser_ids() -> None:
         ConfiguredScreen(
             id="screen-2",
             name="Projector",
-            transport="miracast",
-            capabilities=list(supported_capabilities("miracast")),
+            transport="local_hdmi",
+            capabilities=list(supported_capabilities("local_hdmi")),
         ),
         make_browser_screen("screen-3", "TV 2"),
     ]
@@ -171,8 +171,8 @@ def test_resolve_browser_commands_ignores_unbound_and_non_browser_commands() -> 
         ConfiguredScreen(
             id="screen-2",
             name="Projector",
-            transport="dlna",
-            capabilities=list(supported_capabilities("dlna")),
+            transport="local_hdmi",
+            capabilities=list(supported_capabilities("local_hdmi")),
         ),
     ]
     remote_screens = {"remote:abc": {"screen_id": "remote:abc", "online": True}}

@@ -1,15 +1,28 @@
+# Python bytecode and caches
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Coverage and test outputs
 .coverage
 .coverage.*
 htmlcov/
+
+# Local virtual environments
 .venv/
 venv/
 env/
+
+# Local runtime / test data
 app_data/
+*.log
+*.zip
+
+# Build outputs
 build/
 dist/
 installer-dist/

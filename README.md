@@ -9,6 +9,8 @@ The app now runs in two processes:
 
 The controller UI talks to the local engine over `127.0.0.1:8766`.
 
+For the intended runtime behavior of controller close, engine tray ownership, playback worker shutdown, and restart expectations, see `docs/LIFECYCLE_CONTRACT.md`.
+
 ## What it does
 
 - Lets you choose which monitors should show the fullscreen background video

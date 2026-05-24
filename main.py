@@ -1,37 +1,89 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import faulthandler
-import json
 import ipaddress
+import json
 import mimetypes
 import os
 import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
 import uuid
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+import zipfile
+from datetime import datetime
+from html import escape
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from html import escape
 from pathlib import Path
-from typing import Any
-from urllib.parse import parse_qs, quote, unquote, urlparse
+from typing import Any, Callable
 from urllib.error import URLError
+from urllib.parse import parse_qs, quote, unquote, urlparse
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
-from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPoint, QPropertyAnimation, QSize, QTime, QTimer, Qt, QUrl, Signal
-from PySide6.QtCore import QFileSystemWatcher
-from PySide6.QtGui import QAction, QCloseEvent, QFontMetrics, QGuiApplication, QIcon, QImageReader, QPixmap, QScreen
+from browser_screen_bindings import (
+    BROWSER_BINDING_KEY,
+    browser_binding_remote_id,
+    browser_target_status_detail,
+    configured_browser_screen_ids,
+    resolve_browser_commands,
+    validate_unique_browser_bindings,
+)
+from media_library import (
+    SUPPORTED_MEDIA_EXTENSIONS,
+    build_media_library_index_from_paths,
+    is_image_file,
+    media_category_label,
+    media_relative_path,
+    scan_video_directory,
+)
+from models import (
+    DAY_OPTIONS,
+    ScheduleEntry,
+    ScheduleMediaAssignment,
+    UnifiedScreenTarget,
+)
+from playback_assignment import PlaybackAssignmentService
+from playback_protocol import COMMAND_PROTOCOL_VERSION, PlaybackCommand
+from PySide6.QtCore import (
+    QEasingCurve,
+    QEvent,
+    QFileSystemWatcher,
+    QObject,
+    QPoint,
+    QPropertyAnimation,
+    QSize,
+    Qt,
+    QTime,
+    QTimer,
+    QUrl,
+    Signal,
+)
+from PySide6.QtGui import (
+    QAction,
+    QCloseEvent,
+    QFontMetrics,
+    QGuiApplication,
+    QIcon,
+    QImageReader,
+    QPixmap,
+    QScreen,
+)
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
-from PySide6.QtNetwork import QAbstractSocket, QLocalServer, QLocalSocket, QNetworkInterface
+from PySide6.QtNetwork import (
+    QAbstractSocket,
+    QLocalServer,
+    QLocalSocket,
+    QNetworkInterface,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -46,52 +98,44 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
     QMenu,
+    QMessageBox,
     QPushButton,
+    QSizePolicy,
     QSplitter,
     QStyle,
     QSystemTrayIcon,
-    QLineEdit,
-    QSizePolicy,
+    QTextBrowser,
+    QTextEdit,
     QTimeEdit,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
-from shiboken6 import isValid
-
-from browser_screen_bindings import (
-    BROWSER_BINDING_KEY,
-    browser_binding_remote_id,
-    browser_target_status_detail,
-    configured_browser_screen_ids,
-    resolve_browser_commands,
-    validate_unique_browser_bindings,
+from scheduling import (
+    active_schedule_for_minute,
+    active_schedule_for_screen,
+    referenced_video_files,
+    schedule_assignment_for_screen,
+    schedule_progress,
+    validate_schedule_candidate,
+    validate_schedule_media_assignments,
 )
-from dlna_support import (
-    DLNA_AVTRANSPORT_SERVICE,
-    DLNA_BINDING_KEY,
-    DlnaDevice,
-    build_didl_lite_metadata,
-    build_soap_envelope,
-    dlna_binding_usn,
-    dlna_target_status_detail,
-    is_dlna_media_renderer,
-    parse_device_description,
-    parse_ssdp_response,
-    resolve_dlna_commands,
-    validate_unique_dlna_bindings,
-)
-from miracast_support import (
-    MIRACAST_BINDING_KEY,
-    MiracastDevice,
-    miracast_binding_device_id,
-    miracast_target_status_detail,
-    parse_miracast_devices_from_pnp_json,
-    validate_unique_miracast_bindings,
+from screen_groups import (
+    DEFAULT_GROUP_ID,
+    DEFAULT_GROUP_NAME,
+    ScreenGroup,
+    combined_screen_groups,
+    expand_target_ids,
+    is_group_target_id,
+    normalize_schedule_target_ids,
+    parse_screen_groups,
+    target_label_map,
+    validate_screen_groups,
 )
 from screen_protocols import (
     CAPABILITY_LABELS,
@@ -103,20 +147,9 @@ from screen_protocols import (
     supported_capabilities,
     validate_configured_screens,
 )
-from screen_groups import (
-    DEFAULT_GROUP_ID,
-    DEFAULT_GROUP_NAME,
-    ScreenGroup,
-    combined_screen_groups,
-    expand_target_ids,
-    is_group_target_id,
-    normalize_schedule_target_ids,
-    parse_screen_groups,
-    target_contains_screen,
-    target_label_map,
-    validate_screen_groups,
-)
-
+from screen_registry import ScreenRegistry
+from shiboken6 import isValid
+from ui_styles import apply_dialog_theme
 
 # Long-running local playback has been more stable when Qt is allowed to use
 # its normal Windows video pipeline. We keep a switch to force software
@@ -124,7 +157,12 @@ from screen_groups import (
 # globally anymore because hard native crashes are worse than a rendering
 # fallback.
 if sys.platform == "win32":
-    if os.getenv("BACKGROUND_SCREEN_FORCE_SOFTWARE_DECODE", "").strip().lower() in {"1", "true", "yes", "on"}:
+    if os.getenv("BACKGROUND_SCREEN_FORCE_SOFTWARE_DECODE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
         os.environ.setdefault("QT_FFMPEG_DECODING_HW_DEVICE_TYPES", ",")
         os.environ.setdefault("QT_DISABLE_HW_TEXTURES_CONVERSION", "1")
 
@@ -177,7 +215,11 @@ def load_install_context() -> dict[str, str]:
         data = json.loads(INSTALL_CONTEXT_PATH.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return {}
-    return {str(key): str(value) for key, value in data.items() if isinstance(key, str) and isinstance(value, str)}
+    return {
+        str(key): str(value)
+        for key, value in data.items()
+        if isinstance(key, str) and isinstance(value, str)
+    }
 
 
 def windows_data_dir_for_scope(scope: str) -> Path:
@@ -213,10 +255,10 @@ APP_DATA_DIR = resolve_app_data_dir()
 CONFIG_PATH = APP_DATA_DIR / "config.json"
 ENGINE_STARTUP_STATUS_PATH = APP_DATA_DIR / "engine_startup_status.json"
 ENGINE_STARTUP_LOG_PATH = APP_DATA_DIR / "engine_startup.log"
+ENGINE_DIAGNOSTICS_LOG_PATH = APP_DATA_DIR / "engine_diagnostics.jsonl"
 ENGINE_FAULT_LOG_HANDLE = None
-SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".ogg"}
-SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
-SUPPORTED_MEDIA_EXTENSIONS = SUPPORTED_VIDEO_EXTENSIONS | SUPPORTED_IMAGE_EXTENSIONS
+
+CONFIG_SCHEMA_VERSION = 3
 CONTROL_HIDE_DELAY_MS = 2500
 CONTROL_FADE_DURATION_MS = 1000
 TRANSITION_TO_BLACK_MS = 320
@@ -226,147 +268,52 @@ TRANSITION_METHODS = {
     "cut": "Cut",
     "soft_fade": "Soft Fade",
 }
-DAY_OPTIONS = [
-    ("mon", "Mon"),
-    ("tue", "Tue"),
-    ("wed", "Wed"),
-    ("thu", "Thu"),
-    ("fri", "Fri"),
-    ("sat", "Sat"),
-    ("sun", "Sun"),
-]
-DAY_KEYS = [key for key, _label in DAY_OPTIONS]
-DAY_LABELS = dict(DAY_OPTIONS)
-DAY_KEY_TO_INDEX = {key: index for index, key in enumerate(DAY_KEYS)}
-DAY_INDEX_TO_KEY = {index: key for key, index in DAY_KEY_TO_INDEX.items()}
 
 
-def normalize_day_key(value: str) -> str | None:
-    cleaned = value.strip().lower()
-    for key in DAY_KEYS:
-        if cleaned == key or cleaned.startswith(key):
-            return key
-    return None
+def _default_config_payload() -> dict[str, Any]:
+    return {
+        "schema_version": CONFIG_SCHEMA_VERSION,
+        "configured_screens": [],
+        "screen_groups": [],
+        "selected_monitor_ids": [],
+        "enabled_screen_ids": [],
+        "video_directory": "",
+        "screen_aliases": {},
+        "transition_method": "fade_black",
+        "run_at_startup": False,
+        "lan_pairing_required": False,
+        "lan_allow_unpaired_clients": False,
+        "lan_paired_client_ids": [],
+        "schedules": [],
+    }
 
 
-def normalized_day_keys(days: list[str] | tuple[str, ...] | None) -> list[str]:
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for item in days or []:
-        key = normalize_day_key(str(item))
-        if key is None or key in seen:
-            continue
-        seen.add(key)
-        normalized.append(key)
-    return normalized if normalized else DAY_KEYS[:]
-
-
-def format_day_selection(days: list[str] | tuple[str, ...] | None) -> str:
-    normalized = normalized_day_keys(list(days or []))
-    if normalized == DAY_KEYS:
-        return "Every day"
-    return ", ".join(DAY_LABELS[key] for key in normalized)
-
-
-@dataclass
-class ScheduleEntry:
-    id: str
-    title: str
-    start_time: str
-    end_time: str
-    video_file: str
-    video_label: str
-    screen_ids: list[str]
-    days: list[str]
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "ScheduleEntry":
-        raw_screen_ids = [str(item) for item in data.get("screen_ids", []) if isinstance(item, str)]
-        normalized_screen_ids = normalize_schedule_target_ids(raw_screen_ids)
-        if not normalized_screen_ids:
-            normalized_screen_ids = [DEFAULT_GROUP_ID]
-        return cls(
-            id=str(data.get("id") or uuid.uuid4().hex),
-            title=str(data.get("title") or "Untitled schedule"),
-            start_time=str(data.get("start_time") or "00:00"),
-            end_time=str(data.get("end_time") or "00:00"),
-            video_file=str(data.get("video_file") or ""),
-            video_label=str(data.get("video_label") or data.get("video_file") or ""),
-            screen_ids=normalized_screen_ids,
-            days=[key for item in data.get("days", []) if isinstance(item, str) if (key := normalize_day_key(item)) is not None],
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.id,
-            "title": self.title,
-            "start_time": self.start_time,
-            "end_time": self.end_time,
-            "video_file": self.video_file,
-            "video_label": self.video_label,
-            "screen_ids": self.screen_ids,
-            "days": self.days,
-        }
-
-    @property
-    def range_label(self) -> str:
-        return f"{self.start_time} - {self.end_time} UK"
-
-    @property
-    def days_label(self) -> str:
-        return format_day_selection(self.days)
-
-    @staticmethod
-    def time_to_minutes(value: str) -> int:
-        hours, minutes = [int(part) for part in value.split(":")]
-        return (hours * 60) + minutes
-
-    def selected_days(self) -> list[str]:
-        return normalized_day_keys(self.days)
-
-    def covers_minute(self, minute_of_day: int) -> bool:
-        start = self.time_to_minutes(self.start_time)
-        end = self.time_to_minutes(self.end_time)
-        if start < end:
-            return start <= minute_of_day < end
-        return minute_of_day >= start or minute_of_day < end
-
-    def covers_weekday_minute(self, weekday_index: int, minute_of_day: int) -> bool:
-        if weekday_index not in DAY_INDEX_TO_KEY:
-            return False
-        start = self.time_to_minutes(self.start_time)
-        end = self.time_to_minutes(self.end_time)
-        current_day_key = DAY_INDEX_TO_KEY[weekday_index]
-        if start < end:
-            return current_day_key in self.selected_days() and start <= minute_of_day < end
-        if minute_of_day >= start:
-            return current_day_key in self.selected_days()
-        previous_day_key = DAY_INDEX_TO_KEY[(weekday_index - 1) % 7]
-        return previous_day_key in self.selected_days() and minute_of_day < end
-
-    def split_ranges(self) -> list[tuple[int, int]]:
-        start = self.time_to_minutes(self.start_time)
-        end = self.time_to_minutes(self.end_time)
-        if start == end:
-            return []
-        if start < end:
-            return [(start, end)]
-        return [(start, 1440), (0, end)]
-
-    def weekly_segments(self) -> list[tuple[int, int, int]]:
-        start = self.time_to_minutes(self.start_time)
-        end = self.time_to_minutes(self.end_time)
-        segments: list[tuple[int, int, int]] = []
-        if start == end:
-            return segments
-        for day_key in self.selected_days():
-            day_index = DAY_KEY_TO_INDEX[day_key]
-            if start < end:
-                segments.append((day_index, start, end))
-                continue
-            segments.append((day_index, start, 1440))
-            segments.append(((day_index + 1) % 7, 0, end))
-        return segments
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=str(path.parent),
+            prefix=f"{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            handle.write(text)
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:
+                pass
+            temp_path = Path(handle.name)
+        temp_path.replace(path)
+    finally:
+        if temp_path is not None and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
 
 
 def ensure_app_paths() -> None:
@@ -385,50 +332,128 @@ def migrate_legacy_app_data() -> None:
     shutil.copytree(LEGACY_APP_DATA_DIR, APP_DATA_DIR, dirs_exist_ok=True)
 
 
+def _migrate_config_to_v1(payload: dict[str, Any]) -> dict[str, Any]:
+    migrated = dict(payload)
+    defaults = _default_config_payload()
+    for key, default_value in defaults.items():
+        migrated.setdefault(key, default_value)
+    migrated["schema_version"] = 1
+    return migrated
+
+
+def _migrate_config_v1_to_v2(payload: dict[str, Any]) -> dict[str, Any]:
+    migrated = dict(payload)
+    configured_screens = migrated.get("configured_screens")
+    if not isinstance(configured_screens, list):
+        configured_screens = []
+        migrated["configured_screens"] = configured_screens
+    # Formal registry snapshot key for forward-compatible persistence/modeling.
+    migrated.setdefault("screen_registry", configured_screens)
+    migrated["schema_version"] = 2
+    return migrated
+
+
+def _migrate_config_v2_to_v3(payload: dict[str, Any]) -> dict[str, Any]:
+    migrated = dict(payload)
+    migrated.setdefault("lan_pairing_required", False)
+    migrated.setdefault("lan_allow_unpaired_clients", False)
+    migrated.setdefault("lan_paired_client_ids", [])
+    migrated["schema_version"] = 3
+    return migrated
+
+
+CONFIG_MIGRATIONS: dict[int, Any] = {
+    1: _migrate_config_v1_to_v2,
+    2: _migrate_config_v2_to_v3,
+}
+
+
+def migrate_config(raw_data: object) -> dict[str, Any]:
+    if not isinstance(raw_data, dict):
+        return _default_config_payload()
+
+    migrated = dict(raw_data)
+    schema_version = migrated.get("schema_version")
+    if not isinstance(schema_version, int) or schema_version <= 0:
+        migrated = _migrate_config_to_v1(migrated)
+        schema_version = 1
+
+    # Do not mutate unknown future schemas; preserve payload as-is.
+    if schema_version > CONFIG_SCHEMA_VERSION:
+        defaults = _default_config_payload()
+        for key, default_value in defaults.items():
+            migrated.setdefault(key, default_value)
+        return migrated
+
+    while schema_version < CONFIG_SCHEMA_VERSION:
+        step = CONFIG_MIGRATIONS.get(schema_version)
+        if step is None:
+            break
+        migrated = step(migrated)
+        next_version = migrated.get("schema_version")
+        if not isinstance(next_version, int) or next_version <= schema_version:
+            break
+        schema_version = next_version
+
+    defaults = _default_config_payload()
+    for key, default_value in defaults.items():
+        migrated.setdefault(key, default_value)
+    migrated["schema_version"] = max(
+        1,
+        int(migrated.get("schema_version") or CONFIG_SCHEMA_VERSION),
+    )
+    return migrated
+
+
 def load_config() -> dict[str, Any]:
     ensure_app_paths()
     if not CONFIG_PATH.exists():
-        return {
-            "configured_screens": [],
-            "screen_groups": [],
-            "selected_monitor_ids": [],
-            "video_directory": "",
-            "screen_aliases": {},
-            "transition_method": "fade_black",
-            "run_at_startup": False,
-            "schedules": [],
-        }
+        return _default_config_payload()
 
     try:
         data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
-        return {
-            "configured_screens": [],
-            "screen_groups": [],
-            "selected_monitor_ids": [],
-            "video_directory": "",
-            "screen_aliases": {},
-            "transition_method": "fade_black",
-            "run_at_startup": False,
-            "schedules": [],
-        }
+        return _default_config_payload()
 
-    selected = data.get("selected_monitor_ids")
-    configured_screens = parse_configured_screens(data.get("configured_screens"))
-    screen_groups = parse_screen_groups(data.get("screen_groups"))
-    schedules = data.get("schedules")
-    video_directory = data.get("video_directory")
-    screen_aliases = data.get("screen_aliases")
-    transition_method = data.get("transition_method")
-    run_at_startup = data.get("run_at_startup")
+    migrated = migrate_config(data)
+    schema_version = migrated.get("schema_version")
+    selected = migrated.get("selected_monitor_ids")
+    enabled = migrated.get("enabled_screen_ids")
+    configured_screens = parse_configured_screens(migrated.get("configured_screens"))
+    screen_groups = parse_screen_groups(migrated.get("screen_groups"))
+    schedules = migrated.get("schedules")
+    video_directory = migrated.get("video_directory")
+    screen_aliases = migrated.get("screen_aliases")
+    transition_method = migrated.get("transition_method")
+    run_at_startup = migrated.get("run_at_startup")
+    lan_pairing_required = migrated.get("lan_pairing_required")
+    lan_allow_unpaired_clients = migrated.get("lan_allow_unpaired_clients")
+    lan_paired_client_ids = migrated.get("lan_paired_client_ids")
     return {
+        "schema_version": schema_version
+        if isinstance(schema_version, int) and schema_version > 0
+        else CONFIG_SCHEMA_VERSION,
         "configured_screens": configured_screens,
         "screen_groups": screen_groups,
         "selected_monitor_ids": selected if isinstance(selected, list) else [],
-        "video_directory": str(video_directory) if isinstance(video_directory, str) else "",
+        "enabled_screen_ids": enabled if isinstance(enabled, list) else [],
+        "video_directory": str(video_directory)
+        if isinstance(video_directory, str)
+        else "",
         "screen_aliases": screen_aliases if isinstance(screen_aliases, dict) else {},
-        "transition_method": transition_method if transition_method in TRANSITION_METHODS else "fade_black",
+        "transition_method": transition_method
+        if transition_method in TRANSITION_METHODS
+        else "fade_black",
         "run_at_startup": bool(run_at_startup),
+        "lan_pairing_required": bool(lan_pairing_required),
+        "lan_allow_unpaired_clients": bool(lan_allow_unpaired_clients),
+        "lan_paired_client_ids": [
+            str(item).strip()
+            for item in (
+                lan_paired_client_ids if isinstance(lan_paired_client_ids, list) else []
+            )
+            if str(item).strip()
+        ],
         "schedules": schedules if isinstance(schedules, list) else [],
     }
 
@@ -437,27 +462,40 @@ def save_config(
     configured_screens: list[ConfiguredScreen],
     screen_groups: list[ScreenGroup],
     selected_monitor_ids: list[str],
+    enabled_screen_ids: list[str],
     video_directory: str,
     screen_aliases: dict[str, str],
     transition_method: str,
     run_at_startup: bool,
+    lan_pairing_required: bool,
+    lan_allow_unpaired_clients: bool,
+    lan_paired_client_ids: list[str],
     schedules: list[ScheduleEntry],
 ) -> None:
     ensure_app_paths()
     payload = {
+        "schema_version": CONFIG_SCHEMA_VERSION,
         "configured_screens": [screen.to_dict() for screen in configured_screens],
         "screen_groups": [group.to_dict() for group in screen_groups],
         "selected_monitor_ids": selected_monitor_ids,
+        "enabled_screen_ids": enabled_screen_ids,
         "video_directory": video_directory,
         "screen_aliases": screen_aliases,
         "transition_method": transition_method,
         "run_at_startup": run_at_startup,
+        "lan_pairing_required": bool(lan_pairing_required),
+        "lan_allow_unpaired_clients": bool(lan_allow_unpaired_clients),
+        "lan_paired_client_ids": [
+            str(item).strip() for item in lan_paired_client_ids if str(item).strip()
+        ],
         "schedules": [entry.to_dict() for entry in schedules],
     }
-    CONFIG_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    _atomic_write_text(CONFIG_PATH, json.dumps(payload, indent=2))
 
 
-def write_engine_startup_status(state: str, message: str = "", details: str = "", pid: int | None = None) -> None:
+def write_engine_startup_status(
+    state: str, message: str = "", details: str = "", pid: int | None = None
+) -> None:
     ensure_app_paths()
     payload = {
         "state": state,
@@ -467,7 +505,7 @@ def write_engine_startup_status(state: str, message: str = "", details: str = ""
         "updatedAt": datetime.now().isoformat(timespec="seconds"),
     }
     try:
-        ENGINE_STARTUP_STATUS_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        _atomic_write_text(ENGINE_STARTUP_STATUS_PATH, json.dumps(payload, indent=2))
     except OSError:
         pass
 
@@ -485,7 +523,11 @@ def read_engine_startup_status() -> dict[str, Any]:
 
 def reset_engine_startup_artifacts() -> None:
     ensure_app_paths()
-    for path in (ENGINE_STARTUP_STATUS_PATH, ENGINE_STARTUP_LOG_PATH):
+    for path in (
+        ENGINE_STARTUP_STATUS_PATH,
+        ENGINE_STARTUP_LOG_PATH,
+        ENGINE_DIAGNOSTICS_LOG_PATH,
+    ):
         try:
             path.unlink(missing_ok=True)
         except OSError:
@@ -500,6 +542,74 @@ def append_engine_startup_log(message: str) -> None:
             handle.write(f"[{timestamp}] {message.rstrip()}\n")
     except OSError:
         pass
+
+
+def append_engine_diagnostics_event(
+    event: str,
+    *,
+    details: str = "",
+    severity: str = "info",
+    context: dict[str, Any] | None = None,
+) -> None:
+    ensure_app_paths()
+    payload = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "event": str(event or "unknown"),
+        "severity": str(severity or "info"),
+        "details": str(details or ""),
+        "context": context or {},
+    }
+    try:
+        with ENGINE_DIAGNOSTICS_LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    except OSError:
+        return
+
+
+def export_engine_diagnostics_bundle(
+    *,
+    destination: Path | None = None,
+    snapshot: dict[str, Any] | None = None,
+) -> Path:
+    ensure_app_paths()
+    if destination is None:
+        export_dir = APP_DATA_DIR / "diagnostics_exports"
+        export_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        destination = export_dir / f"engine_diagnostics_{timestamp}.zip"
+    else:
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+
+    diag_snapshot = snapshot if isinstance(snapshot, dict) else {}
+    metadata = {
+        "generatedAt": datetime.now().isoformat(timespec="seconds"),
+        "appDataDir": str(APP_DATA_DIR),
+        "files": {
+            "startupStatus": str(ENGINE_STARTUP_STATUS_PATH),
+            "startupLog": str(ENGINE_STARTUP_LOG_PATH),
+            "diagnosticsLog": str(ENGINE_DIAGNOSTICS_LOG_PATH),
+        },
+    }
+
+    with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "metadata.json",
+            json.dumps(metadata, indent=2, ensure_ascii=False),
+        )
+        archive.writestr(
+            "snapshot.json",
+            json.dumps(diag_snapshot, indent=2, ensure_ascii=False),
+        )
+        for source, arc_name in (
+            (ENGINE_STARTUP_STATUS_PATH, "engine_startup_status.json"),
+            (ENGINE_STARTUP_LOG_PATH, "engine_startup.log"),
+            (ENGINE_DIAGNOSTICS_LOG_PATH, "engine_diagnostics.jsonl"),
+        ):
+            if source.exists() and source.is_file():
+                archive.write(source, arc_name)
+
+    return destination
 
 
 def enable_engine_fault_logging() -> None:
@@ -535,76 +645,11 @@ def current_uk_datetime() -> datetime:
     return datetime.now(UK_TZ)
 
 
-def active_schedule_for_minute(schedules: list[ScheduleEntry], weekday_index: int, minute_of_day: int) -> ScheduleEntry | None:
-    for entry in sorted(schedules, key=lambda item: ScheduleEntry.time_to_minutes(item.start_time)):
-        if entry.covers_weekday_minute(weekday_index, minute_of_day):
-            return entry
-    return None
-
-
-def schedule_progress(entry: ScheduleEntry, now: datetime) -> float:
-    current_minutes = (now.hour * 60) + now.minute + (now.second / 60.0)
-    start = ScheduleEntry.time_to_minutes(entry.start_time)
-    end = ScheduleEntry.time_to_minutes(entry.end_time)
-    if start < end:
-        total = max(end - start, 1)
-        progressed = min(max(current_minutes - start, 0.0), float(total))
-        return progressed / total
-    total = max((1440 - start) + end, 1)
-    if current_minutes >= start:
-        progressed = current_minutes - start
-    else:
-        progressed = (1440 - start) + current_minutes
-    progressed = min(max(progressed, 0.0), float(total))
-    return progressed / total
-
-
-def validate_schedule_candidate(candidate: ScheduleEntry, schedules: list[ScheduleEntry], ignore_id: str | None = None) -> None:
-    if not candidate.title.strip():
-        raise ValueError("Add a title for the schedule.")
-    if candidate.start_time == candidate.end_time:
-        raise ValueError("Start time and end time cannot be the same.")
-    if not candidate.days:
-        raise ValueError("Select at least one day for this schedule.")
-    if not candidate.video_file:
-        raise ValueError("Choose a media file for this schedule.")
-
-    if Path(candidate.video_file).suffix.lower() not in SUPPORTED_MEDIA_EXTENSIONS:
-        raise ValueError("Only supported video and image files can be scheduled.")
-
-    for entry in schedules:
-        if entry.id == ignore_id:
-            continue
-        if any(
-            schedule_targets_overlap(candidate.screen_ids, entry.screen_ids)
-            and candidate_day == entry_day
-            and candidate_start < entry_end and entry_start < candidate_end
-            for candidate_day, candidate_start, candidate_end in candidate.weekly_segments()
-            for entry_day, entry_start, entry_end in entry.weekly_segments()
-        ):
-            raise ValueError(f'"{candidate.title}" overlaps with "{entry.title}" on at least one target screen.')
-
-
-def schedule_targets_overlap(first: list[str], second: list[str]) -> bool:
-    if not first or not second:
-        return True
-    return bool(set(first) & set(second))
-
-
-def active_schedule_for_screen(
-    schedules: list[ScheduleEntry],
-    weekday_index: int,
-    minute_of_day: int,
+def screen_label_from_id(
     screen_id: str,
-    screen_groups: list[ScreenGroup],
-) -> ScheduleEntry | None:
-    for entry in sorted(schedules, key=lambda item: ScheduleEntry.time_to_minutes(item.start_time)):
-        if entry.covers_weekday_minute(weekday_index, minute_of_day) and target_contains_screen(entry.screen_ids, screen_id, screen_groups):
-            return entry
-    return None
-
-
-def screen_label_from_id(screen_id: str, aliases: dict[str, str], screen_groups: list[ScreenGroup] | None = None) -> str:
+    aliases: dict[str, str],
+    screen_groups: list[ScreenGroup] | None = None,
+) -> str:
     if is_group_target_id(screen_id):
         group_labels = target_label_map(screen_groups or [])
         return group_labels.get(screen_id, screen_id)
@@ -617,13 +662,22 @@ def screen_label_from_id(screen_id: str, aliases: dict[str, str], screen_groups:
     return screen_id.split("|", 1)[0]
 
 
-def format_screen_targets(screen_ids: list[str], aliases: dict[str, str], screen_groups: list[ScreenGroup] | None = None) -> str:
+def format_screen_targets(
+    screen_ids: list[str],
+    aliases: dict[str, str],
+    screen_groups: list[ScreenGroup] | None = None,
+) -> str:
     if not screen_ids:
         return "No targets selected"
-    return ", ".join(screen_label_from_id(screen_id, aliases, screen_groups) for screen_id in screen_ids)
+    return ", ".join(
+        screen_label_from_id(screen_id, aliases, screen_groups)
+        for screen_id in screen_ids
+    )
 
 
-def disconnected_screen_ids(screen_ids: list[str], screen_groups: list[ScreenGroup] | None = None) -> list[str]:
+def disconnected_screen_ids(
+    screen_ids: list[str], screen_groups: list[ScreenGroup] | None = None
+) -> list[str]:
     group_ids = target_label_map(screen_groups or [])
     disconnected: list[str] = []
     for screen_id in screen_ids:
@@ -633,8 +687,46 @@ def disconnected_screen_ids(screen_ids: list[str], screen_groups: list[ScreenGro
             disconnected.append(screen_id)
     return disconnected
 
-def referenced_video_files(schedules: list[ScheduleEntry]) -> set[str]:
-    return {entry.video_file for entry in schedules if entry.video_file}
+
+def format_engine_diagnostics_summary(
+    performance: dict[str, Any] | None,
+    *,
+    scanning: bool = False,
+    library_error: str = "",
+) -> tuple[str, str, str]:
+    metrics = performance or {}
+    indexed = max(0, int(metrics.get("indexedFileCount") or 0))
+    scan_ms = max(0, int(metrics.get("mediaScanDurationMs") or 0))
+    snapshot_bytes = max(0, int(metrics.get("snapshotSizeBytes") or 0))
+    worker_count = max(0, int(metrics.get("localPlaybackWorkerCount") or 0))
+    generated_at = str(metrics.get("lastSnapshotGeneratedAt") or "").strip()
+
+    if library_error:
+        secondary = f"Library error • last scan {scan_ms} ms"
+    elif scanning:
+        secondary = f"Library indexing • {indexed} file(s) found so far"
+    else:
+        secondary = (
+            f"Library {indexed} file(s) • last scan {scan_ms} ms • "
+            f"snapshot {snapshot_bytes} bytes"
+        )
+
+    tooltip_lines = [
+        "Engine diagnostics summary",
+        f"Indexed media files: {indexed}",
+        f"Last media scan duration: {scan_ms} ms",
+        f"Last engine snapshot size: {snapshot_bytes} bytes",
+        f"Local playback workers: {worker_count}",
+    ]
+    if generated_at:
+        tooltip_lines.append(f"Last snapshot generated: {generated_at}")
+    if scanning:
+        tooltip_lines.append("Library state: indexing in progress")
+    if library_error:
+        tooltip_lines.append(f"Library error: {library_error}")
+
+    primary = f"{worker_count} worker{'s' if worker_count != 1 else ''}"
+    return primary, secondary, "\n".join(tooltip_lines)
 
 
 def remote_screen_digest(state: dict[str, Any]) -> tuple[Any, ...]:
@@ -652,44 +744,16 @@ def remote_screen_digest(state: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def scan_video_directory(directory: Path | None) -> list[Path]:
-    if directory is None or not directory.exists() or not directory.is_dir():
-        return []
-    return sorted(
-        [path for path in directory.rglob("*") if path.is_file() and path.suffix.lower() in SUPPORTED_MEDIA_EXTENSIONS],
-        key=lambda path: (
-            path.relative_to(directory).parent.as_posix().lower() if directory is not None else "",
-            path.name.lower(),
-        ),
-    )
-
-
-def media_relative_path(path: Path, directory: Path | None) -> str:
-    if directory is None:
-        return path.name
-    return path.relative_to(directory).as_posix()
-
-
-def media_category_label(path: Path, directory: Path | None) -> str:
-    relative = Path(media_relative_path(path, directory))
-    parent = relative.parent.as_posix()
-    return parent if parent not in {"", "."} else "Root"
-
-
-def is_video_file(path: Path) -> bool:
-    return path.suffix.lower() in SUPPORTED_VIDEO_EXTENSIONS
-
-
-def is_image_file(path: Path) -> bool:
-    return path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
-
-
 def load_pixmap_for_bounds(path: Path, bounds: QSize | None = None) -> QPixmap:
     reader = QImageReader(str(path))
     reader.setAutoTransform(True)
     if bounds is not None and bounds.width() > 0 and bounds.height() > 0:
         original_size = reader.size()
-        if original_size.isValid() and original_size.width() > 0 and original_size.height() > 0:
+        if (
+            original_size.isValid()
+            and original_size.width() > 0
+            and original_size.height() > 0
+        ):
             scaled = original_size.scaled(bounds, Qt.AspectRatioMode.KeepAspectRatio)
             if scaled.width() > 0 and scaled.height() > 0:
                 reader.setScaledSize(scaled)
@@ -705,13 +769,91 @@ def screen_display_name(screen: QScreen, aliases: dict[str, str]) -> str:
     return alias or screen.name()
 
 
+def playback_window_uses_tool_mode(platform: str | None = None) -> bool:
+    return (platform or sys.platform).lower().strip() == "win32"
+
+
+def playback_window_flags_for_platform(
+    platform: str | None = None,
+) -> Qt.WindowType:
+    flags = (
+        Qt.WindowType.Window
+        | Qt.WindowType.FramelessWindowHint
+        | Qt.WindowType.WindowStaysOnTopHint
+    )
+    if playback_window_uses_tool_mode(platform):
+        flags |= Qt.WindowType.Tool
+    return flags
+
+
+def apply_windows_playback_surface_mode(widget: QWidget) -> bool:
+    if sys.platform != "win32":
+        return False
+    try:
+        hwnd = int(widget.winId())
+        if hwnd <= 0:
+            return False
+        user32 = ctypes.windll.user32
+        get_window_long = getattr(user32, "GetWindowLongPtrW", None)
+        set_window_long = getattr(user32, "SetWindowLongPtrW", None)
+        if get_window_long is None or set_window_long is None:
+            get_window_long = user32.GetWindowLongW
+            set_window_long = user32.SetWindowLongW
+        gwl_exstyle = -20
+        ws_ex_appwindow = 0x00040000
+        ws_ex_toolwindow = 0x00000080
+        swp_nosize = 0x0001
+        swp_nomove = 0x0002
+        swp_nozorder = 0x0004
+        swp_noactivate = 0x0010
+        swp_framechanged = 0x0020
+        ex_style = int(get_window_long(hwnd, gwl_exstyle) or 0)
+        desired_style = (ex_style | ws_ex_toolwindow) & ~ws_ex_appwindow
+        if desired_style != ex_style:
+            set_window_long(hwnd, gwl_exstyle, desired_style)
+            user32.SetWindowPos(
+                hwnd,
+                0,
+                0,
+                0,
+                0,
+                0,
+                swp_nosize
+                | swp_nomove
+                | swp_nozorder
+                | swp_noactivate
+                | swp_framechanged,
+            )
+        return True
+    except Exception:
+        return False
+
+
 def windows_startup_script() -> Path:
-    appdata = Path.home() / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+    appdata = (
+        Path.home()
+        / "AppData"
+        / "Roaming"
+        / "Microsoft"
+        / "Windows"
+        / "Start Menu"
+        / "Programs"
+        / "Startup"
+    )
     return appdata / "background_screen_controller.vbs"
 
 
 def legacy_windows_startup_script() -> Path:
-    appdata = Path.home() / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+    appdata = (
+        Path.home()
+        / "AppData"
+        / "Roaming"
+        / "Microsoft"
+        / "Windows"
+        / "Start Menu"
+        / "Programs"
+        / "Startup"
+    )
     return appdata / "background_screen_controller.cmd"
 
 
@@ -746,22 +888,56 @@ def windows_hidden_subprocess_kwargs() -> dict[str, Any]:
 def startup_launch_command() -> str:
     if getattr(sys, "frozen", False):
         return f'"{Path(sys.executable).resolve()}"'
-    executable = preferred_windows_python_gui_executable() if sys.platform == "win32" else sys.executable
+    executable = (
+        preferred_windows_python_gui_executable()
+        if sys.platform == "win32"
+        else sys.executable
+    )
     return f'"{executable}" "{APP_ROOT / "main.py"}"'
 
 
 def engine_launch_args() -> list[str]:
     if getattr(sys, "frozen", False):
         return [str(Path(sys.executable).resolve()), "--engine"]
-    executable = preferred_windows_python_gui_executable() if sys.platform == "win32" else sys.executable
+    executable = (
+        preferred_windows_python_gui_executable()
+        if sys.platform == "win32"
+        else sys.executable
+    )
     return [executable, str(APP_ROOT / "main.py"), "--engine"]
+
+
+def controller_launch_args() -> list[str]:
+    if getattr(sys, "frozen", False):
+        return [str(Path(sys.executable).resolve())]
+    executable = (
+        preferred_windows_python_gui_executable()
+        if sys.platform == "win32"
+        else sys.executable
+    )
+    return [executable, str(APP_ROOT / "main.py")]
 
 
 def playback_worker_launch_args(screen_id: str) -> list[str]:
     if getattr(sys, "frozen", False):
-        return [str(Path(sys.executable).resolve()), "--playback-worker", "--screen-id", screen_id]
-    executable = preferred_windows_python_gui_executable() if sys.platform == "win32" else sys.executable
-    return [executable, str(APP_ROOT / "main.py"), "--playback-worker", "--screen-id", screen_id]
+        return [
+            str(Path(sys.executable).resolve()),
+            "--playback-worker",
+            "--screen-id",
+            screen_id,
+        ]
+    executable = (
+        preferred_windows_python_gui_executable()
+        if sys.platform == "win32"
+        else sys.executable
+    )
+    return [
+        executable,
+        str(APP_ROOT / "main.py"),
+        "--playback-worker",
+        "--screen-id",
+        screen_id,
+    ]
 
 
 def is_remote_screen_id(screen_id: str) -> bool:
@@ -805,11 +981,17 @@ class ControllerInstanceCoordinator(QObject):
             if connection is None:
                 continue
             self._connections.append(connection)
-            connection.readyRead.connect(lambda conn=connection: self._handle_ready_read(conn))
-            connection.disconnected.connect(lambda conn=connection: self._drop_connection(conn))
+            connection.readyRead.connect(
+                lambda conn=connection: self._handle_ready_read(conn)
+            )
+            connection.disconnected.connect(
+                lambda conn=connection: self._drop_connection(conn)
+            )
 
     def _handle_ready_read(self, connection: QLocalSocket) -> None:
-        payload = bytes(connection.readAll()).decode("utf-8", errors="ignore").strip().lower()
+        payload = (
+            bytes(connection.readAll()).decode("utf-8", errors="ignore").strip().lower()
+        )
         if payload.startswith("show"):
             self.activation_requested.emit()
         connection.disconnectFromServer()
@@ -837,7 +1019,12 @@ def interface_label_priority(name: str) -> int:
     lowered = name.lower()
     if "ethernet" in lowered:
         return 0
-    if "wi-fi" in lowered or "wifi" in lowered or "wireless" in lowered or "wlan" in lowered:
+    if (
+        "wi-fi" in lowered
+        or "wifi" in lowered
+        or "wireless" in lowered
+        or "wlan" in lowered
+    ):
         return 1
     return 2
 
@@ -862,8 +1049,12 @@ def find_lan_interface_details() -> list[tuple[str, str]]:
                 continue
             if flags & QNetworkInterface.InterfaceFlag.IsLoopBack:
                 continue
-            label = interface.humanReadableName() or interface.name() or "Network Interface"
-            if interface_name_is_virtual(label) or interface_name_is_virtual(interface.name()):
+            label = (
+                interface.humanReadableName() or interface.name() or "Network Interface"
+            )
+            if interface_name_is_virtual(label) or interface_name_is_virtual(
+                interface.name()
+            ):
                 continue
             for entry in interface.addressEntries():
                 ip = entry.ip()
@@ -882,7 +1073,13 @@ def find_lan_interface_details() -> list[tuple[str, str]]:
     if not details:
         details.extend(find_socket_lan_interface_details(existing=set()))
 
-    details.sort(key=lambda item: (interface_label_priority(item[1]), 0 if is_private_ipv4(item[0]) else 1, item[0]))
+    details.sort(
+        key=lambda item: (
+            interface_label_priority(item[1]),
+            0 if is_private_ipv4(item[0]) else 1,
+            item[0],
+        )
+    )
     return details
 
 
@@ -898,7 +1095,14 @@ def find_windows_lan_interface_details(existing: set[str]) -> list[tuple[str, st
     )
     results: list[tuple[str, str, bool]] = []
     try:
-        command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script]
+        command = [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ]
         completed = subprocess.run(
             command,
             capture_output=True,
@@ -971,15 +1175,21 @@ def local_network_hint_snapshot(port: int = LAN_SERVER_PORT) -> dict[str, Any]:
     preferred_ip = preferred_lan_ip(lan_ips)
     hostname = socket.gethostname() or "localhost"
     fqdn = hostname
-    preferred_interface = next((label for address, label in details if address == preferred_ip), "")
+    preferred_interface = next(
+        (label for address, label in details if address == preferred_ip), ""
+    )
     mdns_host = f"{hostname}.local" if hostname else ""
     warnings: list[str] = []
     if not lan_ips:
         warnings.append("No LAN IPv4 address was detected on this computer.")
     elif len(lan_ips) > 1:
-        warnings.append("Multiple LAN addresses were detected. Make sure the TVs are using the same subnet as the preferred IP shown here.")
+        warnings.append(
+            "Multiple LAN addresses were detected. Make sure the TVs are using the same subnet as the preferred IP shown here."
+        )
     if is_wsl_runtime():
-        warnings.append("This app is running inside WSL. For direct LAN reachability, use the Windows build or Windows Python instead of the WSL runtime.")
+        warnings.append(
+            "This app is running inside WSL. For direct LAN reachability, use the Windows build or Windows Python instead of the WSL runtime."
+        )
     return {
         "hostname": hostname,
         "fqdn": fqdn,
@@ -1010,7 +1220,9 @@ def format_request_error(error: Exception) -> str:
     return "The engine request failed."
 
 
-def friendly_remote_name(remote_id: str, aliases: dict[str, str], state: dict[str, Any] | None = None) -> str:
+def friendly_remote_name(
+    remote_id: str, aliases: dict[str, str], state: dict[str, Any] | None = None
+) -> str:
     alias = aliases.get(remote_id, "").strip()
     if alias:
         return alias
@@ -1021,240 +1233,22 @@ def friendly_remote_name(remote_id: str, aliases: dict[str, str], state: dict[st
     return remote_id.removeprefix("remote:")[:8].upper()
 
 
-@dataclass
-class UnifiedScreenTarget:
-    id: str
-    label: str
-    kind: str
-    online: bool
-    detail: str = ""
-    warning: str = ""
-
-
 def configured_screen_summary(screen: ConfiguredScreen) -> str:
-    capability_labels = [CAPABILITY_LABELS.get(item, item) for item in screen.capabilities]
-    capability_text = ", ".join(capability_labels) if capability_labels else "No capabilities"
+    capability_labels = [
+        CAPABILITY_LABELS.get(item, item) for item in screen.capabilities
+    ]
+    capability_text = (
+        ", ".join(capability_labels) if capability_labels else "No capabilities"
+    )
     return f"{TRANSPORT_LABELS.get(screen.transport, screen.transport)} • {capability_text}"
 
 
-def configured_screen_name_map(configured_screens: list[ConfiguredScreen]) -> dict[str, str]:
-    return {screen.id: screen.name for screen in configured_screens if screen.name.strip()}
-
-
-class DlnaAdapter:
-    def __init__(self, server_port: int = LAN_SERVER_PORT) -> None:
-        self.server_port = server_port
-        self._lock = threading.RLock()
-        self._devices: dict[str, dict[str, Any]] = {}
-        self._change_callback = None
-        self._last_command_versions: dict[str, int] = {}
-
-    def set_change_callback(self, callback) -> None:
-        self._change_callback = callback
-
-    def _notify_change(self) -> None:
-        callback = self._change_callback
-        if callback is not None:
-            try:
-                callback()
-            except Exception:
-                return
-
-    def devices_snapshot(self) -> list[dict[str, Any]]:
-        with self._lock:
-            return [dict(item) for item in sorted(self._devices.values(), key=lambda device: str(device.get("friendly_name") or device.get("usn") or "").lower())]
-
-    def devices_by_usn(self) -> dict[str, dict[str, Any]]:
-        with self._lock:
-            return {usn: dict(device) for usn, device in self._devices.items()}
-
-    def refresh_discovery(self, timeout_seconds: float = 1.2) -> None:
-        discovered: dict[str, dict[str, Any]] = {}
-        search_targets = [
-            "urn:schemas-upnp-org:device:MediaRenderer:1",
-            "ssdp:all",
-        ]
-        for search_target in search_targets:
-            for payload, sender_ip in self._perform_msearch(search_target, timeout_seconds):
-                headers = parse_ssdp_response(payload)
-                if not headers or not is_dlna_media_renderer(headers):
-                    continue
-                location = str(headers.get("LOCATION") or "").strip()
-                if not location:
-                    continue
-                device = self._fetch_device_description(location, sender_ip)
-                if device is None:
-                    continue
-                discovered[device.usn] = device.to_dict()
-        with self._lock:
-            previous = json.dumps(self._devices, sort_keys=True)
-            current = json.dumps(discovered, sort_keys=True)
-            self._devices = discovered
-        if previous != current:
-            self._notify_change()
-
-    def _perform_msearch(self, search_target: str, timeout_seconds: float) -> list[tuple[bytes, str]]:
-        request = (
-            "M-SEARCH * HTTP/1.1\r\n"
-            "HOST: 239.255.255.250:1900\r\n"
-            'MAN: "ssdp:discover"\r\n'
-            "MX: 1\r\n"
-            f"ST: {search_target}\r\n\r\n"
-        ).encode("utf-8")
-        responses: list[tuple[bytes, str]] = []
-        sock = None
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.settimeout(timeout_seconds)
-            sock.sendto(request, ("239.255.255.250", 1900))
-            deadline = time.monotonic() + timeout_seconds
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                sock.settimeout(remaining)
-                try:
-                    payload, address = sock.recvfrom(65535)
-                except socket.timeout:
-                    break
-                responses.append((payload, address[0] if address else ""))
-        except OSError:
-            return []
-        finally:
-            try:
-                if sock is not None:
-                    sock.close()
-            except Exception:
-                pass
-        return responses
-
-    def _fetch_device_description(self, location_url: str, sender_ip: str) -> DlnaDevice | None:
-        try:
-            request = Request(location_url, headers={"Accept": "text/xml, application/xml"}, method="GET")
-            with urlopen(request, timeout=2.5) as response:
-                xml_text = response.read().decode("utf-8", errors="ignore")
-        except Exception:
-            return None
-        return parse_device_description(location_url, xml_text, sender_ip)
-
-    def apply_commands(self, commands: dict[str, dict[str, Any]]) -> None:
-        for usn, command in commands.items():
-            version = int(command.get("version") or 0)
-            if self._last_command_versions.get(usn) == version:
-                continue
-            self._last_command_versions[usn] = version
-            threading.Thread(
-                target=self._apply_command_safe,
-                args=(usn, dict(command)),
-                name=f"dlna-command-{version}",
-                daemon=True,
-            ).start()
-
-    def _apply_command_safe(self, usn: str, command: dict[str, Any]) -> None:
-        try:
-            self._apply_command(usn, command)
-        except Exception as error:  # noqa: BLE001
-            append_engine_startup_log(f"DLNA command failed for {usn}: {error}")
-
-    def _apply_command(self, usn: str, command: dict[str, Any]) -> None:
-        devices = self.devices_by_usn()
-        device_state = devices.get(usn)
-        if device_state is None:
-            return
-        device = DlnaDevice.from_dict(device_state)
-        command_type = str(command.get("type") or "clear")
-        media_url = str(command.get("mediaUrl") or "").strip()
-        if command_type != "play" or not media_url:
-            self._soap_action(device.av_transport_url, DLNA_AVTRANSPORT_SERVICE, "Stop", {"InstanceID": 0})
-            return
-        label = str(command.get("label") or "Background Screen Media")
-        media_kind = str(command.get("mediaKind") or "").strip().lower()
-        mime_type = "image/jpeg" if media_kind == "image" else "video/mp4"
-        metadata = build_didl_lite_metadata(label, media_url, mime_type)
-        self._soap_action(
-            device.av_transport_url,
-            DLNA_AVTRANSPORT_SERVICE,
-            "SetAVTransportURI",
-            {
-                "InstanceID": 0,
-                "CurrentURI": media_url,
-                "CurrentURIMetaData": metadata,
-            },
-        )
-        if bool(command.get("paused")):
-            self._soap_action(device.av_transport_url, DLNA_AVTRANSPORT_SERVICE, "Pause", {"InstanceID": 0})
-        else:
-            self._soap_action(device.av_transport_url, DLNA_AVTRANSPORT_SERVICE, "Play", {"InstanceID": 0, "Speed": 1})
-
-    def _soap_action(self, control_url: str, service_type: str, action: str, arguments: dict[str, Any]) -> None:
-        body = build_soap_envelope(service_type, action, arguments).encode("utf-8")
-        request = Request(
-            control_url,
-            data=body,
-            headers={
-                "Content-Type": 'text/xml; charset="utf-8"',
-                "SOAPAction": f'"{service_type}#{action}"',
-                "Content-Length": str(len(body)),
-            },
-            method="POST",
-        )
-        with urlopen(request, timeout=4.0) as response:
-            response.read()
-
-
-class MiracastAdapter:
-    def __init__(self) -> None:
-        self._lock = threading.RLock()
-        self._devices: dict[str, dict[str, Any]] = {}
-        self._change_callback = None
-
-    def set_change_callback(self, callback) -> None:
-        self._change_callback = callback
-
-    def _notify_change(self) -> None:
-        callback = self._change_callback
-        if callback is not None:
-            try:
-                callback()
-            except Exception:
-                return
-
-    def devices_snapshot(self) -> list[dict[str, Any]]:
-        with self._lock:
-            return [dict(item) for item in sorted(self._devices.values(), key=lambda device: str(device.get("friendly_name") or device.get("device_id") or "").lower())]
-
-    def devices_by_id(self) -> dict[str, dict[str, Any]]:
-        with self._lock:
-            return {device_id: dict(device) for device_id, device in self._devices.items()}
-
-    def refresh_discovery(self) -> None:
-        command = (
-            "$devices = Get-PnpDevice | "
-            "Select-Object Status,Class,FriendlyName,InstanceId; "
-            "$devices | ConvertTo-Json -Depth 2"
-        )
-        try:
-            result = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", command],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=8.0,
-                **windows_hidden_subprocess_kwargs(),
-            )
-        except OSError:
-            return
-        if result.returncode != 0:
-            return
-        devices = parse_miracast_devices_from_pnp_json(result.stdout or "")
-        discovered = {device.device_id: device.to_dict() for device in devices}
-        with self._lock:
-            previous = json.dumps(self._devices, sort_keys=True)
-            current = json.dumps(discovered, sort_keys=True)
-            self._devices = discovered
-        if previous != current:
-            self._notify_change()
+def configured_screen_name_map(
+    configured_screens: list[ConfiguredScreen],
+) -> dict[str, str]:
+    return {
+        screen.id: screen.name for screen in configured_screens if screen.name.strip()
+    }
 
 
 class LanRemoteServer:
@@ -1262,7 +1256,7 @@ class LanRemoteServer:
         self.port = port
         self.media_root: Path | None = None
         self._lock = threading.RLock()
-        self._commands: dict[str, dict[str, Any]] = {}
+        self._commands: dict[str, PlaybackCommand] = {}
         self._remote_screens: dict[str, dict[str, Any]] = {}
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -1275,6 +1269,10 @@ class LanRemoteServer:
         self._network_snapshot_cache: dict[str, Any] | None = None
         self._network_snapshot_cache_until = 0.0
         self._change_callback = None
+        self._pairing_required = False
+        self._allow_unpaired_clients = False
+        self._paired_client_ids: set[str] = set()
+        self._pending_clients: dict[str, dict[str, Any]] = {}
 
     def start(self) -> None:
         if self._httpd is not None:
@@ -1302,7 +1300,9 @@ class LanRemoteServer:
             self._httpd = None
             return
 
-        self._thread = threading.Thread(target=self._httpd.serve_forever, name="lan-remote-server", daemon=True)
+        self._thread = threading.Thread(
+            target=self._httpd.serve_forever, name="lan-remote-server", daemon=True
+        )
         self._thread.start()
         self.ensure_firewall_rule(force_retry=True)
 
@@ -1322,10 +1322,133 @@ class LanRemoteServer:
 
     def set_commands(self, commands: dict[str, dict[str, Any]]) -> None:
         with self._lock:
-            self._commands = json.loads(json.dumps(commands))
+            normalized: dict[str, PlaybackCommand] = {}
+            for screen_id, payload in commands.items():
+                normalized[screen_id] = PlaybackCommand.from_payload(
+                    payload, default_screen_id=screen_id
+                )
+            self._commands = normalized
+
+    def purge_remote_screens(self, include_online: bool = False) -> list[str]:
+        removed_ids: list[str] = []
+        now = time.time()
+        with self._lock:
+            for screen_id, state in list(self._remote_screens.items()):
+                is_online = (
+                    now - float(state.get("last_seen") or 0.0)
+                ) <= REMOTE_SCREEN_TIMEOUT_SECONDS
+                if include_online or not is_online:
+                    removed_ids.append(screen_id)
+                    self._remote_screens.pop(screen_id, None)
+                    self._commands.pop(screen_id, None)
+        if removed_ids:
+            self._notify_change()
+        return removed_ids
+
+    def merge_remote_screens(self, source_id: str, target_id: str) -> bool:
+        source = str(source_id or "").strip()
+        target = str(target_id or "").strip()
+        if not source.startswith("remote:") or not target.startswith("remote:"):
+            return False
+        if source == target:
+            return False
+        merged = False
+        with self._lock:
+            source_state = self._remote_screens.get(source)
+            target_state = self._remote_screens.get(target)
+            if source_state is None or target_state is None:
+                return False
+
+            source_seen = float(source_state.get("last_seen") or 0.0)
+            target_seen = float(target_state.get("last_seen") or 0.0)
+            if source_seen > target_seen:
+                target_state["last_seen"] = source_seen
+                target_state["ip"] = str(
+                    source_state.get("ip") or target_state.get("ip") or ""
+                )
+                target_state["width"] = int(
+                    source_state.get("width") or target_state.get("width") or 0
+                )
+                target_state["height"] = int(
+                    source_state.get("height") or target_state.get("height") or 0
+                )
+                target_state["user_agent"] = str(
+                    source_state.get("user_agent")
+                    or target_state.get("user_agent")
+                    or ""
+                )
+                target_state["ready"] = bool(source_state.get("ready"))
+                target_state["state"] = str(
+                    source_state.get("state")
+                    or target_state.get("state")
+                    or "connected"
+                )
+                target_state["current_media"] = str(
+                    source_state.get("current_media")
+                    or target_state.get("current_media")
+                    or ""
+                )
+                target_state["drift_ms"] = source_state.get("drift_ms")
+            if (
+                not str(target_state.get("client_id") or "").strip()
+                and str(source_state.get("client_id") or "").strip()
+            ):
+                target_state["client_id"] = str(source_state.get("client_id") or "")
+            target_state["last_command_version"] = max(
+                int(source_state.get("last_command_version") or 0),
+                int(target_state.get("last_command_version") or 0),
+            )
+            self._remote_screens[target] = target_state
+            self._remote_screens.pop(source, None)
+
+            source_command = self._commands.pop(source, None)
+            if source_command is not None and target not in self._commands:
+                if isinstance(source_command, PlaybackCommand):
+                    source_command.screen_id = target
+                    self._commands[target] = source_command
+                elif isinstance(source_command, dict):
+                    parsed = PlaybackCommand.from_payload(
+                        source_command, default_screen_id=target
+                    )
+                    parsed.screen_id = target
+                    self._commands[target] = parsed
+            merged = True
+        if merged:
+            self._notify_change()
+        return merged
 
     def set_change_callback(self, callback) -> None:
         self._change_callback = callback
+
+    def configure_pairing(
+        self,
+        required: bool,
+        allow_unpaired_clients: bool,
+        paired_client_ids: list[str] | None = None,
+    ) -> None:
+        with self._lock:
+            self._pairing_required = bool(required)
+            self._allow_unpaired_clients = bool(allow_unpaired_clients)
+            self._paired_client_ids = {
+                str(item).strip()
+                for item in (paired_client_ids or [])
+                if str(item).strip()
+            }
+            if not self._pairing_required:
+                self._pending_clients = {}
+            self.invalidate_network_snapshot()
+        self._notify_change()
+
+    def pending_clients_snapshot(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [
+                dict(item)
+                for item in sorted(
+                    self._pending_clients.values(),
+                    key=lambda row: str(row.get("last_seen") or ""),
+                    reverse=True,
+                )
+            ]
 
     def _notify_change(self) -> None:
         callback = self._change_callback
@@ -1342,6 +1465,15 @@ class LanRemoteServer:
 
         requested_name = str(payload.get("name") or "").strip().lower()
         requested_agent = str(payload.get("userAgent") or "").strip()
+        requested_client_id = str(payload.get("clientId") or "").strip()
+
+        # Most stable match: persisted browser client id (independent of IP).
+        if requested_client_id:
+            for screen_id, state in self._remote_screens.items():
+                state_client_id = str(state.get("client_id") or "").strip()
+                if state_client_id and state_client_id == requested_client_id:
+                    return screen_id
+
         ip_matches: list[str] = []
         for screen_id, state in self._remote_screens.items():
             state_name = str(state.get("name") or "").strip().lower()
@@ -1349,26 +1481,50 @@ class LanRemoteServer:
             state_agent = str(state.get("user_agent") or "").strip()
             if state_ip == client_ip:
                 ip_matches.append(screen_id)
-            if requested_name and state_name == requested_name and state_ip == client_ip:
+            if (
+                state_ip == client_ip
+                and requested_agent
+                and state_agent
+                and state_agent == requested_agent
+            ):
                 return screen_id
-            if state_ip == client_ip and requested_agent and state_agent == requested_agent:
+            if (
+                requested_name
+                and state_name == requested_name
+                and state_ip == client_ip
+            ):
                 return screen_id
         if len(ip_matches) == 1:
             return ip_matches[0]
-        identity_seed = requested_name or requested_agent or "remote-screen"
-        stable_id = uuid.uuid5(uuid.NAMESPACE_URL, f"{client_ip}|{identity_seed}")
+
+        # New screen: derive stable id from client id when available.
+        identity_seed = (
+            requested_client_id or requested_agent or requested_name or "remote-screen"
+        )
+        stable_id = uuid.uuid5(uuid.NAMESPACE_URL, identity_seed)
         return f"remote:{stable_id.hex}"
 
-    def register_or_refresh(self, payload: dict[str, Any], client_ip: str) -> dict[str, Any]:
+    def register_or_refresh(
+        self, payload: dict[str, Any], client_ip: str
+    ) -> dict[str, Any]:
         screen_id = self._resolve_remote_screen_id(payload, client_ip)
-        name = str(payload.get("name") or "").strip() or f"Remote Screen {len(self._remote_screens) + 1}"
         state = self._remote_screens.get(screen_id, {})
+        requested_name = str(payload.get("name") or "").strip()
+        client_id = str(payload.get("clientId") or "").strip()
+        if requested_name:
+            name = requested_name
+        else:
+            name = (
+                str(state.get("name") or "").strip()
+                or f"Remote {screen_id.removeprefix('remote:')[:8].upper()}"
+            )
         now = time.time()
         state.update(
             {
                 "screen_id": screen_id,
                 "name": name,
                 "user_agent": str(payload.get("userAgent") or ""),
+                "client_id": client_id,
                 "ip": client_ip,
                 "width": int(payload.get("width") or 0),
                 "height": int(payload.get("height") or 0),
@@ -1379,9 +1535,30 @@ class LanRemoteServer:
                 "drift_ms": None,
                 "last_seen": now,
                 "last_command_version": int(payload.get("lastCommandVersion") or 0),
+                "paired": (
+                    (not self._pairing_required)
+                    or (not client_id)
+                    or (client_id in self._paired_client_ids)
+                ),
             }
         )
         self._remote_screens[screen_id] = state
+        if (
+            self._pairing_required
+            and client_id
+            and client_id not in self._paired_client_ids
+        ):
+            self._pending_clients[client_id] = {
+                "client_id": client_id,
+                "name": name,
+                "screen_id": screen_id,
+                "ip": client_ip,
+                "user_agent": str(payload.get("userAgent") or ""),
+                "last_seen": now,
+            }
+        elif client_id:
+            self._pending_clients.pop(client_id, None)
+        self.invalidate_network_snapshot()
         return {
             "screenId": screen_id,
             "name": name,
@@ -1389,14 +1566,25 @@ class LanRemoteServer:
             "heartbeatIntervalMs": REMOTE_HEARTBEAT_INTERVAL_MS,
             "serverTimeMs": current_timestamp_ms(),
             "hostname": self._hostname,
+            "pairingRequired": self._pairing_required,
+            "paired": bool(state.get("paired", True)),
         }
 
-    def update_heartbeat(self, payload: dict[str, Any], client_ip: str) -> dict[str, Any]:
+    def update_heartbeat(
+        self, payload: dict[str, Any], client_ip: str
+    ) -> dict[str, Any]:
         screen_id = str(payload.get("screenId") or "").strip()
+        client_id = str(payload.get("clientId") or "").strip()
         if not screen_id.startswith("remote:"):
             return {"ok": False, "error": "invalid_screen_id"}
         now = time.time()
-        state = self._remote_screens.get(screen_id, {"screen_id": screen_id, "name": screen_id.removeprefix("remote:")[:8].upper()})
+        state = self._remote_screens.get(
+            screen_id,
+            {
+                "screen_id": screen_id,
+                "name": screen_id.removeprefix("remote:")[:8].upper(),
+            },
+        )
         state.update(
             {
                 "ip": client_ip,
@@ -1408,39 +1596,97 @@ class LanRemoteServer:
                 "width": int(payload.get("width") or state.get("width") or 0),
                 "height": int(payload.get("height") or state.get("height") or 0),
                 "last_seen": now,
-                "last_command_version": int(payload.get("lastCommandVersion") or state.get("last_command_version") or 0),
+                "last_command_version": int(
+                    payload.get("lastCommandVersion")
+                    or state.get("last_command_version")
+                    or 0
+                ),
+                "client_id": client_id or str(state.get("client_id") or ""),
+                "paired": (
+                    (not self._pairing_required)
+                    or (
+                        (client_id or str(state.get("client_id") or ""))
+                        in self._paired_client_ids
+                    )
+                ),
             }
         )
         self._remote_screens[screen_id] = state
+        effective_client_id = str(state.get("client_id") or "").strip()
+        if (
+            self._pairing_required
+            and effective_client_id
+            and effective_client_id not in self._paired_client_ids
+        ):
+            self._pending_clients[effective_client_id] = {
+                "client_id": effective_client_id,
+                "name": str(state.get("name") or screen_id),
+                "screen_id": screen_id,
+                "ip": client_ip,
+                "user_agent": str(state.get("user_agent") or ""),
+                "last_seen": now,
+            }
+        elif effective_client_id:
+            self._pending_clients.pop(effective_client_id, None)
+        self.invalidate_network_snapshot()
         return {"ok": True, "serverTimeMs": current_timestamp_ms()}
 
     def remote_screens_snapshot(self) -> list[dict[str, Any]]:
         now = time.time()
         with self._lock:
             for state in self._remote_screens.values():
-                state["online"] = (now - float(state.get("last_seen") or 0.0)) <= REMOTE_SCREEN_TIMEOUT_SECONDS
-            return [dict(item) for item in sorted(self._remote_screens.values(), key=lambda row: str(row.get("name") or row.get("screen_id") or "").lower())]
+                state["online"] = (
+                    now - float(state.get("last_seen") or 0.0)
+                ) <= REMOTE_SCREEN_TIMEOUT_SECONDS
+            return [
+                dict(item)
+                for item in sorted(
+                    self._remote_screens.values(),
+                    key=lambda row: str(
+                        row.get("name") or row.get("screen_id") or ""
+                    ).lower(),
+                )
+            ]
 
     def command_for_screen(self, screen_id: str) -> dict[str, Any]:
         with self._lock:
+            state = self._remote_screens.get(screen_id) or {}
+            paired = bool(state.get("paired", True))
+            if (
+                self._pairing_required
+                and not self._allow_unpaired_clients
+                and not paired
+            ):
+                return PlaybackCommand.clear(
+                    screen_id,
+                    message="Pair this screen in the controller before playback can start.",
+                ).to_remote_dict()
             direct = self._commands.get(screen_id)
             if direct is not None:
-                return dict(direct)
+                return direct.to_remote_dict()
             online_screen_ids = [
                 remote_id
                 for remote_id, state in self._remote_screens.items()
                 if bool(state.get("online"))
             ]
             active_commands = [
-                dict(command)
+                command
                 for command in self._commands.values()
-                if str(command.get("type") or "") == "play" and is_remote_screen_id(str(command.get("screenId") or ""))
+                if command.command_type == "play"
+                and is_remote_screen_id(command.screen_id)
             ]
-            if len(online_screen_ids) == 1 and online_screen_ids[0] == screen_id and len(active_commands) == 1:
-                fallback = active_commands[0]
-                fallback["screenId"] = screen_id
-                return fallback
-            return {"version": 0, "mode": "idle", "type": "clear", "message": ""}
+            if (
+                len(online_screen_ids) == 1
+                and online_screen_ids[0] == screen_id
+                and len(active_commands) == 1
+            ):
+                fallback = PlaybackCommand.from_payload(
+                    active_commands[0].to_engine_dict(),
+                    default_screen_id=screen_id,
+                )
+                fallback.screen_id = screen_id
+                return fallback.to_remote_dict()
+            return PlaybackCommand.clear(screen_id).to_remote_dict()
 
     def invalidate_network_snapshot(self) -> None:
         with self._lock:
@@ -1450,7 +1696,10 @@ class LanRemoteServer:
     def network_snapshot(self) -> dict[str, Any]:
         now = time.time()
         with self._lock:
-            if self._network_snapshot_cache is not None and now < self._network_snapshot_cache_until:
+            if (
+                self._network_snapshot_cache is not None
+                and now < self._network_snapshot_cache_until
+            ):
                 return dict(self._network_snapshot_cache)
 
         snapshot = local_network_hint_snapshot(self.port)
@@ -1462,10 +1711,18 @@ class LanRemoteServer:
         snapshot["hostname"] = self._hostname
         snapshot["fqdn"] = self._fqdn
         snapshot["firewallConfigured"] = self._firewall_configured
-        snapshot["hostname_url"] = f"http://{self._hostname}:{self.port}/tv" if self._hostname else ""
+        snapshot["hostname_url"] = (
+            f"http://{self._hostname}:{self.port}/tv" if self._hostname else ""
+        )
         snapshot["mdnsHost"] = f"{self._hostname}.local" if self._hostname else ""
-        snapshot["mdns_url"] = f"http://{self._hostname}.local:{self.port}/tv" if self._hostname else ""
+        snapshot["mdns_url"] = (
+            f"http://{self._hostname}.local:{self.port}/tv" if self._hostname else ""
+        )
         snapshot["warnings"] = warnings
+        snapshot["pairingRequired"] = bool(self._pairing_required)
+        snapshot["allowUnpairedClients"] = bool(self._allow_unpaired_clients)
+        snapshot["pendingClientCount"] = len(self._pending_clients)
+        snapshot["pendingClients"] = self.pending_clients_snapshot()
         with self._lock:
             self._network_snapshot_cache = dict(snapshot)
             self._network_snapshot_cache_until = now + NETWORK_SNAPSHOT_CACHE_SECONDS
@@ -1480,17 +1737,28 @@ class LanRemoteServer:
         if not force_retry and now - self._firewall_last_check < 30.0:
             return self._firewall_configured
         self._firewall_last_check = now
-        executable = Path(sys.executable if getattr(sys, "frozen", False) else sys.executable).resolve()
+        executable = Path(
+            sys.executable if getattr(sys, "frozen", False) else sys.executable
+        ).resolve()
         rule_name = f"{APP_NAME} LAN Server"
         try:
             show_rule = subprocess.run(
-                ["netsh", "advfirewall", "firewall", "show", "rule", f"name={rule_name}"],
+                [
+                    "netsh",
+                    "advfirewall",
+                    "firewall",
+                    "show",
+                    "rule",
+                    f"name={rule_name}",
+                ],
                 capture_output=True,
                 text=True,
                 check=False,
                 **windows_hidden_subprocess_kwargs(),
             )
-            if show_rule.returncode == 0 and "No rules match" not in (show_rule.stdout or ""):
+            if show_rule.returncode == 0 and "No rules match" not in (
+                show_rule.stdout or ""
+            ):
                 self._firewall_configured = True
                 self._firewall_warning = ""
                 self.invalidate_network_snapshot()
@@ -1508,7 +1776,7 @@ class LanRemoteServer:
                     "profile=private",
                     "protocol=TCP",
                     f"localport={self.port}",
-                    f'program={executable}',
+                    f"program={executable}",
                     "enable=yes",
                 ],
                 capture_output=True,
@@ -1539,7 +1807,12 @@ class LanRemoteServer:
             return {}
         return payload if isinstance(payload, dict) else {}
 
-    def _write_json(self, handler: BaseHTTPRequestHandler, payload: dict[str, Any], status: int = HTTPStatus.OK) -> None:
+    def _write_json(
+        self,
+        handler: BaseHTTPRequestHandler,
+        payload: dict[str, Any],
+        status: int = HTTPStatus.OK,
+    ) -> None:
         body = json.dumps(payload).encode("utf-8")
         try:
             handler.send_response(int(status))
@@ -1551,7 +1824,13 @@ class LanRemoteServer:
         except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError):
             return
 
-    def _write_text(self, handler: BaseHTTPRequestHandler, body: str, content_type: str = "text/html; charset=utf-8", status: int = HTTPStatus.OK) -> None:
+    def _write_text(
+        self,
+        handler: BaseHTTPRequestHandler,
+        body: str,
+        content_type: str = "text/html; charset=utf-8",
+        status: int = HTTPStatus.OK,
+    ) -> None:
         encoded = body.encode("utf-8")
         handler.send_response(int(status))
         handler.send_header("Content-Type", content_type)
@@ -1607,9 +1886,15 @@ class LanRemoteServer:
             if parsed.path.startswith("/media/"):
                 self._serve_media(handler, parsed.path.removeprefix("/media/"))
                 return
-            self._write_text(handler, "Not found", "text/plain; charset=utf-8", HTTPStatus.NOT_FOUND)
+            self._write_text(
+                handler, "Not found", "text/plain; charset=utf-8", HTTPStatus.NOT_FOUND
+            )
         except Exception as error:  # noqa: BLE001
-            self._write_json(handler, {"ok": False, "error": str(error)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            self._write_json(
+                handler,
+                {"ok": False, "error": str(error)},
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
     def _handle_post(self, handler: BaseHTTPRequestHandler) -> None:
         parsed = urlparse(handler.path)
@@ -1627,39 +1912,65 @@ class LanRemoteServer:
             self._notify_change()
             self._write_json(handler, response)
             return
-        self._write_text(handler, "Not found", "text/plain; charset=utf-8", HTTPStatus.NOT_FOUND)
+        self._write_text(
+            handler, "Not found", "text/plain; charset=utf-8", HTTPStatus.NOT_FOUND
+        )
 
     def _serve_media(self, handler: BaseHTTPRequestHandler, relative_path: str) -> None:
         with self._lock:
             media_root = self.media_root
         if media_root is None:
-            self._write_text(handler, "No media folder configured", "text/plain; charset=utf-8", HTTPStatus.NOT_FOUND)
+            self._write_text(
+                handler,
+                "No media folder configured",
+                "text/plain; charset=utf-8",
+                HTTPStatus.NOT_FOUND,
+            )
             return
         decoded = Path(unquote(relative_path))
         target = (media_root / decoded).resolve()
         try:
             target.relative_to(media_root.resolve())
         except ValueError:
-            self._write_text(handler, "Forbidden", "text/plain; charset=utf-8", HTTPStatus.FORBIDDEN)
+            self._write_text(
+                handler, "Forbidden", "text/plain; charset=utf-8", HTTPStatus.FORBIDDEN
+            )
             return
         if not target.exists() or not target.is_file():
-            self._write_text(handler, "Not found", "text/plain; charset=utf-8", HTTPStatus.NOT_FOUND)
+            self._write_text(
+                handler, "Not found", "text/plain; charset=utf-8", HTTPStatus.NOT_FOUND
+            )
             return
         self._serve_file(handler, target, cache_control="public, max-age=60")
 
-    def _serve_absolute_media(self, handler: BaseHTTPRequestHandler, absolute_path: str) -> None:
+    def _serve_absolute_media(
+        self, handler: BaseHTTPRequestHandler, absolute_path: str
+    ) -> None:
         target = Path(unquote(absolute_path)).expanduser()
-        if not target.exists() or not target.is_file() or target.suffix.lower() not in SUPPORTED_MEDIA_EXTENSIONS:
-            self._write_text(handler, "Not found", "text/plain; charset=utf-8", HTTPStatus.NOT_FOUND)
+        if (
+            not target.exists()
+            or not target.is_file()
+            or target.suffix.lower() not in SUPPORTED_MEDIA_EXTENSIONS
+        ):
+            self._write_text(
+                handler, "Not found", "text/plain; charset=utf-8", HTTPStatus.NOT_FOUND
+            )
             return
         self._serve_file(handler, target, cache_control="public, max-age=30")
 
-    def _serve_file(self, handler: BaseHTTPRequestHandler, target: Path, cache_control: str) -> None:
+    def _serve_file(
+        self, handler: BaseHTTPRequestHandler, target: Path, cache_control: str
+    ) -> None:
         content_type, _encoding = mimetypes.guess_type(str(target))
         try:
             stat = target.stat()
         except OSError:
-            self._write_text(handler, "Unable to read media", "text/plain; charset=utf-8", HTTPStatus.INTERNAL_SERVER_ERROR)
+            self._write_text(
+                handler,
+                "Unable to read media",
+                "text/plain; charset=utf-8",
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
             return
 
         total_size = int(stat.st_size)
@@ -1673,7 +1984,11 @@ class LanRemoteServer:
             try:
                 if start_text:
                     start = max(0, int(start_text))
-                    end = min(total_size - 1, int(end_text)) if end_text else total_size - 1
+                    end = (
+                        min(total_size - 1, int(end_text))
+                        if end_text
+                        else total_size - 1
+                    )
                 elif end_text:
                     suffix_length = max(0, int(end_text))
                     start = max(0, total_size - suffix_length)
@@ -1694,7 +2009,12 @@ class LanRemoteServer:
         try:
             file_handle = target.open("rb")
         except OSError:
-            self._write_text(handler, "Unable to read media", "text/plain; charset=utf-8", HTTPStatus.INTERNAL_SERVER_ERROR)
+            self._write_text(
+                handler,
+                "Unable to read media",
+                "text/plain; charset=utf-8",
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
             return
 
         handler.send_response(status)
@@ -1749,6 +2069,7 @@ class LanRemoteServer:
     (() => {
       const POLL_MS = __POLL_MS__;
       const HEARTBEAT_MS = __HEARTBEAT_MS__;
+      const COMMAND_PROTOCOL_VERSION = __COMMAND_PROTOCOL_VERSION__;
       const storeKey = 'backgroundScreenRemote';
       const overlay = document.getElementById('overlay');
       const message = document.getElementById('message');
@@ -1764,12 +2085,27 @@ class LanRemoteServer:
       let activeCommand = null;
       let serverOffset = 0;
       let pendingTimer = null;
+      let imageCycleTimer = null;
+      let imageCycleUrls = [];
+      let imageCycleIndex = 0;
       let lastVideoProgressAt = Date.now();
       let lastVideoPosition = 0;
       let videoRecoveryCount = 0;
 
+      function makeClientId() {
+        try {
+          if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+            return window.crypto.randomUUID();
+          }
+        } catch (_err) {}
+        return 'client-' + Math.random().toString(36).slice(2) + '-' + Date.now().toString(36);
+      }
       function loadState() {
         try { remoteState = JSON.parse(localStorage.getItem(storeKey) || '{}') || {}; } catch (_err) { remoteState = {}; }
+        if (!remoteState.clientId || typeof remoteState.clientId !== 'string') {
+          remoteState.clientId = makeClientId();
+          saveState();
+        }
       }
       function saveState() {
         localStorage.setItem(storeKey, JSON.stringify(remoteState));
@@ -1796,6 +2132,7 @@ class LanRemoteServer:
         }
         const payload = {
           screenId: remoteState.screenId || '',
+          clientId: remoteState.clientId || '',
           name: remoteState.name,
           userAgent: navigator.userAgent,
           width: window.innerWidth,
@@ -1814,6 +2151,14 @@ class LanRemoteServer:
           clearTimeout(pendingTimer);
           pendingTimer = null;
         }
+      }
+      function clearImageCycle() {
+        if (imageCycleTimer) {
+          clearInterval(imageCycleTimer);
+          imageCycleTimer = null;
+        }
+        imageCycleUrls = [];
+        imageCycleIndex = 0;
       }
       function markVideoProgress() {
         lastVideoProgressAt = Date.now();
@@ -1838,6 +2183,7 @@ class LanRemoteServer:
       }
       function applyClear(command) {
         clearPending();
+        clearImageCycle();
         const run = () => {
           fadeToBlack(true);
           stopVideos();
@@ -1856,6 +2202,8 @@ class LanRemoteServer:
       }
       function scheduleImage(command) {
         clearPending();
+        clearImageCycle();
+        const mediaUrls = Array.isArray(command.mediaUrls) && command.mediaUrls.length ? command.mediaUrls : [command.mediaUrl];
         const loader = new Image();
         loader.onload = () => {
           const run = () => {
@@ -1865,20 +2213,32 @@ class LanRemoteServer:
             imageLayer.style.opacity = '1';
             currentKind = 'image';
             activeMedia = command.label || command.relativePath || '';
-            activeSourceUrl = command.mediaUrl || '';
+            activeSourceUrl = mediaUrls[0] || '';
             activeCommand = command;
             message.style.opacity = '0';
             setStatus((remoteState.name || 'Remote Screen') + ' showing image');
             setTimeout(() => fadeToBlack(false), command.transition === 'cut' ? 20 : 220);
+            if (command.cycle && mediaUrls.length > 1) {
+              imageCycleUrls = mediaUrls.slice();
+              imageCycleIndex = 0;
+              const intervalMs = Math.max(2000, Number(command.cycleIntervalSeconds || 10) * 1000);
+              imageCycleTimer = setInterval(() => {
+                if (!imageCycleUrls.length || currentKind !== 'image') return;
+                imageCycleIndex = (imageCycleIndex + 1) % imageCycleUrls.length;
+                imageLayer.src = imageCycleUrls[imageCycleIndex];
+                activeSourceUrl = imageLayer.src || imageCycleUrls[imageCycleIndex];
+              }, intervalMs);
+            }
           };
           const delay = Math.max(0, Number(command.playAtMs || 0) - nowServerMs());
           pendingTimer = setTimeout(run, delay);
         };
         loader.onerror = () => applyClear({ message: 'Unable to load image.' });
-        loader.src = command.mediaUrl;
+        loader.src = mediaUrls[0] || command.mediaUrl;
       }
       function scheduleVideo(command) {
         clearPending();
+        clearImageCycle();
         stagingVideo.pause();
         stagingVideo.src = command.mediaUrl;
         stagingVideo.currentTime = 0;
@@ -1921,7 +2281,14 @@ class LanRemoteServer:
         stagingVideo.addEventListener('canplay', ready, { once: true });
       }
       async function applyCommand(command) {
-        if (!command || Number(command.version || 0) === currentVersion) return;
+        if (!command) return;
+        const protocolVersion = Number(command.protocolVersion || 1);
+        if (protocolVersion > COMMAND_PROTOCOL_VERSION) {
+          applyClear({ message: 'Client update required for this command protocol.' });
+          setStatus((remoteState.name || 'Remote Screen') + ' protocol mismatch');
+          return;
+        }
+        if (Number(command.version || 0) === currentVersion) return;
         currentVersion = Number(command.version || 0);
         if (!command.mediaUrl || command.type === 'clear') {
           applyClear(command);
@@ -2021,7 +2388,11 @@ class LanRemoteServer:
 </body>
 </html>
 """
-        return html.replace("__POLL_MS__", str(REMOTE_POLL_INTERVAL_MS)).replace("__HEARTBEAT_MS__", str(REMOTE_HEARTBEAT_INTERVAL_MS))
+        return (
+            html.replace("__POLL_MS__", str(REMOTE_POLL_INTERVAL_MS))
+            .replace("__HEARTBEAT_MS__", str(REMOTE_HEARTBEAT_INTERVAL_MS))
+            .replace("__COMMAND_PROTOCOL_VERSION__", str(COMMAND_PROTOCOL_VERSION))
+        )
 
 
 class PlaybackWindow(QWidget):
@@ -2050,7 +2421,6 @@ class PlaybackWindow(QWidget):
         self.playback_watchdog_timer = QTimer(self)
         self.playback_watchdog_timer.setInterval(3000)
         self.playback_watchdog_timer.timeout.connect(self.check_playback_health)
-        self.playback_watchdog_timer.start()
         self._scheduled_action = None
         self.transition_animation: QPropertyAnimation | None = None
         self.controls_animation: QPropertyAnimation | None = None
@@ -2064,14 +2434,18 @@ class PlaybackWindow(QWidget):
         self._last_player_position = -1
         self._last_progress_monotonic = time.monotonic()
         self._stall_recovery_count = 0
+        self.image_cycle_paths: list[Path] = []
+        self.image_cycle_index = 0
+        self.image_cycle_timer = QTimer(self)
+        self.image_cycle_timer.setSingleShot(False)
+        self.image_cycle_timer.timeout.connect(self.advance_image_cycle)
 
         self.setWindowTitle(title)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet("background: #000;")
         self.setMouseTracking(True)
-        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
-        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        self.setWindowFlags(playback_window_flags_for_platform())
 
         self.player = QMediaPlayer(self)
         self.player.setLoops(QMediaPlayer.Loops.Infinite)
@@ -2093,7 +2467,9 @@ class PlaybackWindow(QWidget):
         self.message_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.message_label.setWordWrap(True)
         self.message_label.setStyleSheet(
-            "color: rgba(244,247,251,0.72); font-size: 20px; padding: 24px;"
+            "color: #e9f4ff; font-size: 20px; padding: 18px 22px;"
+            " background: rgba(23,48,67,0.44); border: 1px solid rgba(132,220,198,0.35);"
+            " border-radius: 18px;"
         )
 
         self.black_overlay = QFrame(self)
@@ -2106,17 +2482,20 @@ class PlaybackWindow(QWidget):
         self.controls_container.setStyleSheet(
             """
             QWidget {
-                background: rgba(0, 0, 0, 0.46);
-                border: 1px solid rgba(255,255,255,0.14);
+                background: rgba(23, 48, 67, 0.42);
+                border: 1px solid rgba(132,220,198,0.38);
                 border-radius: 999px;
             }
             QPushButton {
                 background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #84dcc6, stop:1 #5db7f0);
-                color: #04111b;
-                border: none;
+                color: #0f2740;
+                border: 1px solid rgba(255,255,255,0.28);
                 border-radius: 999px;
                 padding: 10px 18px;
-                font-weight: 600;
+                font-weight: 700;
+            }
+            QPushButton:pressed {
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #70ccb5, stop:1 #4ea8df);
             }
             """
         )
@@ -2133,11 +2512,16 @@ class PlaybackWindow(QWidget):
 
         self.message_label.raise_()
 
+    def apply_surface_window_mode(self) -> None:
+        apply_windows_playback_surface_mode(self)
+
     def show_on_screen(self) -> None:
         geometry = self.screen_ref.geometry()
         self.setGeometry(geometry)
         self.move(geometry.topLeft())
         self.showFullScreen()
+        self.apply_surface_window_mode()
+        QTimer.singleShot(0, self.apply_surface_window_mode)
         self.raise_()
         self.position_overlays()
         self.show_controls()
@@ -2168,6 +2552,22 @@ class PlaybackWindow(QWidget):
         )
         self.controls_container.raise_()
 
+    def should_run_playback_watchdog(self) -> bool:
+        return (
+            self.current_media_kind == "video"
+            and not self.is_paused
+            and self.current_video_path is not None
+        )
+
+    def sync_playback_watchdog_timer(self) -> None:
+        if not hasattr(self, "playback_watchdog_timer"):
+            return
+        if self.should_run_playback_watchdog():
+            if not self.playback_watchdog_timer.isActive():
+                self.playback_watchdog_timer.start()
+            return
+        self.playback_watchdog_timer.stop()
+
     def set_paused(self, paused: bool) -> None:
         if not self.is_runtime_alive():
             return
@@ -2179,9 +2579,12 @@ class PlaybackWindow(QWidget):
         elif self.current_entry_id is not None:
             if self.current_media_kind == "video":
                 self.player.play()
+        self.sync_playback_watchdog_timer()
 
     def set_transition_method(self, method: str) -> None:
-        self.transition_method = method if method in TRANSITION_METHODS else "fade_black"
+        self.transition_method = (
+            method if method in TRANSITION_METHODS else "fade_black"
+        )
 
     def show_controls(self) -> None:
         if not self.is_runtime_alive():
@@ -2198,7 +2601,13 @@ class PlaybackWindow(QWidget):
             return
         self.animate_opacity(self.controls_effect, 0.0, CONTROL_FADE_DURATION_MS)
 
-    def animate_opacity(self, effect: QGraphicsOpacityEffect, target: float, duration: int, on_finished=None) -> None:
+    def animate_opacity(
+        self,
+        effect: QGraphicsOpacityEffect,
+        target: float,
+        duration: int,
+        on_finished=None,
+    ) -> None:
         if not self.is_runtime_alive():
             return
         animation = QPropertyAnimation(effect, b"opacity", self)
@@ -2225,7 +2634,9 @@ class PlaybackWindow(QWidget):
                 self.transition_callback = None
                 callback_ref()
 
-        self.animate_opacity(self.black_overlay_effect, target, duration, done if callback else None)
+        self.animate_opacity(
+            self.black_overlay_effect, target, duration, done if callback else None
+        )
 
     def clear_playback(self, message: str, show_message: bool = True) -> None:
         if not self.is_runtime_alive():
@@ -2245,6 +2656,10 @@ class PlaybackWindow(QWidget):
         self._last_player_position = -1
         self._last_progress_monotonic = time.monotonic()
         self._stall_recovery_count = 0
+        self.image_cycle_timer.stop()
+        self.image_cycle_paths = []
+        self.image_cycle_index = 0
+        self.playback_watchdog_timer.stop()
         self.player.stop()
         self.video_widget.hide()
         self.image_label.hide()
@@ -2256,11 +2671,20 @@ class PlaybackWindow(QWidget):
             self.message_label.hide()
         self.fade_black_to(1.0, TRANSITION_TO_BLACK_MS)
 
-    def clear_playback_at(self, message: str, play_at_ms: int | None = None, show_message: bool = True) -> None:
-        self.schedule_action(lambda: self.clear_playback(message, show_message=show_message), play_at_ms)
+    def clear_playback_at(
+        self, message: str, play_at_ms: int | None = None, show_message: bool = True
+    ) -> None:
+        self.schedule_action(
+            lambda: self.clear_playback(message, show_message=show_message), play_at_ms
+        )
 
     def is_runtime_alive(self) -> bool:
-        return not self._is_closing and isValid(self) and hasattr(self, "player") and isValid(self.player)
+        return (
+            not self._is_closing
+            and isValid(self)
+            and hasattr(self, "player")
+            and isValid(self.player)
+        )
 
     def schedule_action(self, callback, play_at_ms: int | None = None) -> None:
         if play_at_ms is None or play_at_ms <= current_timestamp_ms() + 25:
@@ -2284,7 +2708,14 @@ class PlaybackWindow(QWidget):
             return None
         return (int(stat.st_mtime_ns), int(stat.st_size))
 
-    def switch_to_source(self, source_key: str, path: Path, display_label: str, entry_id: str | None, force_reload: bool = False) -> None:
+    def switch_to_source(
+        self,
+        source_key: str,
+        path: Path,
+        display_label: str,
+        entry_id: str | None,
+        force_reload: bool = False,
+    ) -> None:
         if not self.is_runtime_alive():
             return
         source_signature = self.source_signature(path)
@@ -2292,7 +2723,11 @@ class PlaybackWindow(QWidget):
             self.clear_playback(f"Missing media file:\n{display_label}")
             return
 
-        if not force_reload and self.current_source_key == source_key and self.current_source_signature == source_signature:
+        if (
+            not force_reload
+            and self.current_source_key == source_key
+            and self.current_source_signature == source_signature
+        ):
             return
 
         self.pending_entry = None
@@ -2317,7 +2752,9 @@ class PlaybackWindow(QWidget):
             return
 
         target = 0.55 if self.transition_method == "soft_fade" else 1.0
-        duration = 220 if self.transition_method == "soft_fade" else TRANSITION_TO_BLACK_MS
+        duration = (
+            220 if self.transition_method == "soft_fade" else TRANSITION_TO_BLACK_MS
+        )
         self.fade_black_to(target, duration, self.apply_pending_entry)
 
     def switch_to_source_at(
@@ -2330,20 +2767,37 @@ class PlaybackWindow(QWidget):
         force_reload: bool = False,
     ) -> None:
         self.schedule_action(
-            lambda: self.switch_to_source(source_key, path, display_label, entry_id, force_reload=force_reload),
+            lambda: self.switch_to_source(
+                source_key, path, display_label, entry_id, force_reload=force_reload
+            ),
             play_at_ms,
         )
 
-    def switch_to_entry(self, entry: ScheduleEntry | None, video_directory: Path | None, force_reload: bool = False, play_at_ms: int | None = None) -> None:
+    def switch_to_entry(
+        self,
+        entry: ScheduleEntry | None,
+        video_directory: Path | None,
+        force_reload: bool = False,
+        play_at_ms: int | None = None,
+    ) -> None:
         if not self.is_runtime_alive():
             return
         if entry is None:
-            self.clear_playback_at("No media scheduled for the current UK time.", play_at_ms)
+            self.clear_playback_at(
+                "No media scheduled for the current UK time.", play_at_ms
+            )
             return
 
-        video_path = (video_directory / entry.video_file) if video_directory is not None else None
+        video_path = (
+            (video_directory / entry.video_file)
+            if video_directory is not None
+            else None
+        )
         if video_path is None or not video_path.exists():
-            self.clear_playback_at(f"Missing media file:\n{entry.video_label or entry.video_file}", play_at_ms)
+            self.clear_playback_at(
+                f"Missing media file:\n{entry.video_label or entry.video_file}",
+                play_at_ms,
+            )
             return
         self.switch_to_source_at(
             f"schedule:{entry.id}",
@@ -2354,9 +2808,18 @@ class PlaybackWindow(QWidget):
             force_reload=force_reload,
         )
 
-    def switch_to_override(self, path: Path, label: str, force_reload: bool = False, play_at_ms: int | None = None) -> None:
+    def switch_to_override(
+        self,
+        path: Path,
+        label: str,
+        force_reload: bool = False,
+        play_at_ms: int | None = None,
+    ) -> None:
         if not self.is_runtime_alive():
             return
+        self.image_cycle_timer.stop()
+        self.image_cycle_paths = []
+        self.image_cycle_index = 0
         self.switch_to_source_at(
             f"override:{self.screen_id}:{path.resolve()}",
             path,
@@ -2364,6 +2827,51 @@ class PlaybackWindow(QWidget):
             f"override:{self.screen_id}",
             play_at_ms=play_at_ms,
             force_reload=force_reload,
+        )
+
+    def switch_to_image_cycle(
+        self,
+        paths: list[Path],
+        label: str,
+        interval_seconds: int,
+        play_at_ms: int | None = None,
+    ) -> None:
+        if not self.is_runtime_alive() or len(paths) < 2:
+            return
+
+        def apply_cycle() -> None:
+            valid_paths = [
+                path for path in paths if path.exists() and is_image_file(path)
+            ]
+            if len(valid_paths) < 2:
+                return
+            self.image_cycle_paths = valid_paths
+            self.image_cycle_index = 0
+            self.switch_to_source(
+                f"cycle:{self.screen_id}:{'|'.join(str(path.resolve()) for path in valid_paths)}:0",
+                valid_paths[0],
+                label or valid_paths[0].name,
+                self.current_entry_id,
+                force_reload=True,
+            )
+            self.image_cycle_timer.start(max(2000, int(interval_seconds) * 1000))
+
+        self.schedule_action(apply_cycle, play_at_ms)
+
+    def advance_image_cycle(self) -> None:
+        if not self.is_runtime_alive() or len(self.image_cycle_paths) < 2:
+            self.image_cycle_timer.stop()
+            return
+        self.image_cycle_index = (self.image_cycle_index + 1) % len(
+            self.image_cycle_paths
+        )
+        current_path = self.image_cycle_paths[self.image_cycle_index]
+        self.switch_to_source(
+            f"cycle:{self.screen_id}:{'|'.join(str(path.resolve()) for path in self.image_cycle_paths)}:{self.image_cycle_index}",
+            current_path,
+            current_path.name,
+            self.current_entry_id,
+            force_reload=True,
         )
 
     def apply_pending_entry(self) -> None:
@@ -2401,11 +2909,16 @@ class PlaybackWindow(QWidget):
             self._ready_source_key = self.current_source_key
             self.current_video_path = None
             self.pause_button.setEnabled(False)
+            self.sync_playback_watchdog_timer()
             self.update_image_display()
             if self.transition_method == "cut":
                 self.black_overlay_effect.setOpacity(0.0)
             else:
-                duration = 380 if self.transition_method == "soft_fade" else TRANSITION_FROM_BLACK_MS
+                duration = (
+                    380
+                    if self.transition_method == "soft_fade"
+                    else TRANSITION_FROM_BLACK_MS
+                )
                 self.fade_black_to(0.0, duration)
         else:
             self.image_label.hide()
@@ -2418,6 +2931,7 @@ class PlaybackWindow(QWidget):
             self._last_player_position = -1
             self._last_progress_monotonic = time.monotonic()
             self._stall_recovery_count = 0
+            self.sync_playback_watchdog_timer()
             if self.is_paused:
                 self.player.pause()
             else:
@@ -2441,20 +2955,31 @@ class PlaybackWindow(QWidget):
             return
         if self.current_media_kind != "video":
             return
-        if status in {
-            QMediaPlayer.MediaStatus.LoadedMedia,
-            QMediaPlayer.MediaStatus.BufferedMedia,
-        } and self.current_source_key is not None and self._ready_source_key != self.current_source_key:
+        if (
+            status
+            in {
+                QMediaPlayer.MediaStatus.LoadedMedia,
+                QMediaPlayer.MediaStatus.BufferedMedia,
+            }
+            and self.current_source_key is not None
+            and self._ready_source_key != self.current_source_key
+        ):
             self._ready_source_key = self.current_source_key
             if not self.is_paused:
                 self.player.play()
             if self.transition_method == "cut":
                 self.black_overlay_effect.setOpacity(0.0)
             else:
-                duration = 380 if self.transition_method == "soft_fade" else TRANSITION_FROM_BLACK_MS
+                duration = (
+                    380
+                    if self.transition_method == "soft_fade"
+                    else TRANSITION_FROM_BLACK_MS
+                )
                 self.fade_black_to(0.0, duration)
         elif status == QMediaPlayer.MediaStatus.StalledMedia:
-            append_engine_startup_log(f"Playback stalled on {self.screen_id}; attempting recovery.")
+            append_engine_startup_log(
+                f"Playback stalled on {self.screen_id}; attempting recovery."
+            )
             self.recover_stalled_video()
 
     def on_media_error(self, error, error_string: str) -> None:
@@ -2477,7 +3002,11 @@ class PlaybackWindow(QWidget):
     def check_playback_health(self) -> None:
         if not self.is_runtime_alive():
             return
-        if self.current_media_kind != "video" or self.is_paused or self.current_video_path is None:
+        if (
+            self.current_media_kind != "video"
+            or self.is_paused
+            or self.current_video_path is None
+        ):
             return
         if self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
             return
@@ -2490,7 +3019,11 @@ class PlaybackWindow(QWidget):
         self.recover_stalled_video()
 
     def recover_stalled_video(self) -> None:
-        if not self.is_runtime_alive() or self.current_media_kind != "video" or self.current_video_path is None:
+        if (
+            not self.is_runtime_alive()
+            or self.current_media_kind != "video"
+            or self.current_video_path is None
+        ):
             return
         self._stall_recovery_count += 1
         self._last_progress_monotonic = time.monotonic()
@@ -2504,13 +3037,16 @@ class PlaybackWindow(QWidget):
             if not self.is_paused:
                 self.player.play()
         except Exception as error:  # noqa: BLE001
-            append_engine_startup_log(f"Failed to recover stalled video on {self.screen_id}: {error}")
+            append_engine_startup_log(
+                f"Failed to recover stalled video on {self.screen_id}: {error}"
+            )
 
     def closeEvent(self, event: QCloseEvent) -> None:  # type: ignore[override]
         self._is_closing = True
         self.controls_hide_timer.stop()
         self.scheduled_action_timer.stop()
         self.playback_watchdog_timer.stop()
+        self.image_cycle_timer.stop()
         if hasattr(self, "player") and isValid(self.player):
             self.player.stop()
         super().closeEvent(event)
@@ -2537,7 +3073,8 @@ class PlaybackCoordinator(QWidget):
         self.virtual_screen_ids: set[str] = set()
         self.screen_groups: list[ScreenGroup] = []
         self.command_version = 0
-        self.screen_commands: dict[str, dict[str, Any]] = {}
+        self.screen_commands: dict[str, PlaybackCommand] = {}
+        self.assignment_service = PlaybackAssignmentService()
         self.last_assignment_keys: dict[str, str] = {}
         self.schedule_timer = QTimer(self)
         self.schedule_timer.setSingleShot(True)
@@ -2559,20 +3096,27 @@ class PlaybackCoordinator(QWidget):
         self.sync_current_entry(force=True)
 
     def set_transition_method(self, method: str) -> None:
-        self.transition_method = method if method in TRANSITION_METHODS else "fade_black"
-        if not self.manage_local_windows:
-            return
-        for screen_id, window in list(self.windows.items()):
-            if not self.is_window_usable(screen_id, window):
-                continue
-            window.set_transition_method(self.transition_method)
+        self.transition_method = (
+            method if method in TRANSITION_METHODS else "fade_black"
+        )
+        if self.manage_local_windows:
+            for screen_id, window in list(self.windows.items()):
+                if not self.is_window_usable(screen_id, window):
+                    continue
+                window.set_transition_method(self.transition_method)
+        # Transition method is part of command semantics. Force command refresh/version bump
+        # so LAN clients and local worker processes apply the new transition immediately.
+        self.last_assignment_keys = {}
+        self.sync_current_entry(force=True)
 
     def set_virtual_screen_ids(self, screen_ids: set[str]) -> None:
         self.virtual_screen_ids = set(screen_ids)
         self.sync_current_entry(force=True)
 
     def set_screen_groups(self, groups: list[ScreenGroup]) -> None:
-        self.screen_groups = [ScreenGroup.from_dict(group.to_dict()) for group in groups]
+        self.screen_groups = [
+            ScreenGroup.from_dict(group.to_dict()) for group in groups
+        ]
         self.sync_current_entry(force=True)
 
     def launch_windows(self) -> None:
@@ -2638,7 +3182,11 @@ class PlaybackCoordinator(QWidget):
         self.sync_current_entry(force=True)
 
     def clear_quick_play(self, target_screen_ids: list[str] | None = None) -> None:
-        targets = list(self.quick_play_paths.keys()) if target_screen_ids is None else target_screen_ids
+        targets = (
+            list(self.quick_play_paths.keys())
+            if target_screen_ids is None
+            else target_screen_ids
+        )
         for screen_id in targets:
             self.quick_play_paths.pop(screen_id, None)
             self.quick_play_labels.pop(screen_id, None)
@@ -2663,86 +3211,50 @@ class PlaybackCoordinator(QWidget):
             for entry in self.schedules
             for screen_id in expand_target_ids(entry.screen_ids, self.screen_groups)
         }
-        return sorted(set(self.selected_monitor_ids) | set(self.quick_play_paths.keys()) | schedule_targets)
+        return sorted(
+            set(self.selected_monitor_ids)
+            | set(self.quick_play_paths.keys())
+            | schedule_targets
+        )
 
     def has_launch_targets(self) -> bool:
         if self.selected_monitor_ids or self.quick_play_paths:
             return True
         return any(bool(entry.screen_ids) for entry in self.schedules)
 
-    def assignment_for_screen(self, screen_id: str, weekday_index: int, minute_of_day: int) -> dict[str, Any]:
-        override_path = self.quick_play_paths.get(screen_id)
-        if override_path is not None:
-            return {
-                "key": f"override:{screen_id}:{override_path.resolve()}:{self.is_paused}",
-                "type": "play",
-                "mode": "quick_play",
-                "path": override_path,
-                "label": self.quick_play_labels.get(screen_id, override_path.name),
-                "entry_id": f"override:{screen_id}",
-                "message": "",
-            }
-        entry = active_schedule_for_screen(self.schedules, weekday_index, minute_of_day, screen_id, self.screen_groups)
-        if entry is None:
-            return {
-                "key": f"clear:{screen_id}",
-                "type": "clear",
-                "mode": "idle",
-                "path": None,
-                "label": "",
-                "entry_id": None,
-                "message": "No media scheduled for the current UK time.",
-            }
-        media_path = (self.video_directory / entry.video_file) if self.video_directory is not None else None
-        if media_path is None or not media_path.exists():
-            return {
-                "key": f"clear-missing:{screen_id}:{entry.video_file}",
-                "type": "clear",
-                "mode": "schedule",
-                "path": None,
-                "label": entry.video_label or entry.video_file,
-                "entry_id": entry.id,
-                "message": f"Missing media file:\n{entry.video_label or entry.video_file}",
-            }
-        return {
-            "key": f"schedule:{entry.id}:{media_path.resolve()}:{self.is_paused}",
-            "type": "play",
-            "mode": "schedule",
-            "path": media_path,
-            "label": entry.video_label or entry.video_file,
-            "relative_path": entry.video_file,
-            "entry_id": entry.id,
-            "message": "",
-        }
+    def assignment_for_screen(
+        self, screen_id: str, weekday_index: int, minute_of_day: int
+    ) -> dict[str, Any]:
+        return self.assignment_service.assignment_for_screen(
+            screen_id=screen_id,
+            weekday_index=weekday_index,
+            minute_of_day=minute_of_day,
+            quick_play_paths=self.quick_play_paths,
+            quick_play_labels=self.quick_play_labels,
+            is_paused=self.is_paused,
+            schedules=self.schedules,
+            screen_groups=self.screen_groups,
+            video_directory=self.video_directory,
+        )
 
-    def build_screen_command(self, screen_id: str, assignment: dict[str, Any], play_at_ms: int, version: int) -> dict[str, Any]:
-        media_path = assignment.get("path")
-        media_kind = ""
-        if isinstance(media_path, Path):
-            if is_image_file(media_path):
-                media_kind = "image"
-            elif is_video_file(media_path):
-                media_kind = "video"
-        return {
-            "screen_id": screen_id,
-            "version": version,
-            "type": assignment.get("type", "clear"),
-            "mode": assignment.get("mode", "idle"),
-            "entry_id": assignment.get("entry_id"),
-            "message": assignment.get("message", ""),
-            "label": assignment.get("label", ""),
-            "path": str(media_path) if isinstance(media_path, Path) else "",
-            "relative_path": assignment.get("relative_path", ""),
-            "media_kind": media_kind,
-            "play_at_ms": play_at_ms,
-            "transition": self.transition_method,
-            "paused": self.is_paused,
-        }
+    def build_screen_command(
+        self, screen_id: str, assignment: dict[str, Any], play_at_ms: int, version: int
+    ) -> PlaybackCommand:
+        return self.assignment_service.build_screen_command(
+            screen_id=screen_id,
+            assignment=assignment,
+            play_at_ms=play_at_ms,
+            version=version,
+            transition_method=self.transition_method,
+            is_paused=self.is_paused,
+        )
 
     def sync_current_entry(self, force: bool = False) -> None:
         _, minute_of_day, weekday_index = current_uk_time()
         assignments = {
-            screen_id: self.assignment_for_screen(screen_id, weekday_index, minute_of_day)
+            screen_id: self.assignment_for_screen(
+                screen_id, weekday_index, minute_of_day
+            )
             for screen_id in self.all_active_screen_ids()
         }
         if self.manage_local_windows:
@@ -2757,11 +3269,20 @@ class PlaybackCoordinator(QWidget):
                     if created is not None:
                         created.set_transition_method(self.transition_method)
                         created.set_paused(self.is_paused)
-        assignment_keys = {screen_id: str(assignment.get("key") or "") for screen_id, assignment in assignments.items()}
-        changed_screen_ids = {screen_id for screen_id, key in assignment_keys.items() if self.last_assignment_keys.get(screen_id) != key}
+        assignment_keys = {
+            screen_id: str(assignment.get("key") or "")
+            for screen_id, assignment in assignments.items()
+        }
+        changed_screen_ids = {
+            screen_id
+            for screen_id, key in assignment_keys.items()
+            if self.last_assignment_keys.get(screen_id) != key
+        }
         removed_screen_ids = set(self.last_assignment_keys) - set(assignment_keys)
         schedule_update = force or bool(changed_screen_ids) or bool(removed_screen_ids)
-        play_at_ms = current_timestamp_ms() + REMOTE_SYNC_LEAD_MS if schedule_update else None
+        play_at_ms = (
+            current_timestamp_ms() + REMOTE_SYNC_LEAD_MS if schedule_update else None
+        )
         first_entry_id: str | None = None
         if self.manage_local_windows:
             for screen_id, window in list(self.windows.items()):
@@ -2769,12 +3290,18 @@ class PlaybackCoordinator(QWidget):
                     continue
                 assignment = assignments.get(screen_id)
                 if assignment is None:
-                    if not is_remote_screen_id(screen_id) and screen_id not in self.virtual_screen_ids:
+                    if (
+                        not is_remote_screen_id(screen_id)
+                        and screen_id not in self.virtual_screen_ids
+                    ):
                         self.windows.pop(screen_id, None)
                         if isValid(window):
                             window.close()
                         continue
-                if assignment.get("type") == "play" and assignment.get("mode") == "quick_play":
+                if (
+                    assignment.get("type") == "play"
+                    and assignment.get("mode") == "quick_play"
+                ):
                     override_path = assignment.get("path")
                     if isinstance(override_path, Path):
                         window.switch_to_override(
@@ -2784,9 +3311,33 @@ class PlaybackCoordinator(QWidget):
                             play_at_ms=play_at_ms,
                         )
                 elif assignment.get("type") == "play":
-                    entry = next((item for item in self.schedules if item.id == assignment.get("entry_id")), None)
+                    entry = next(
+                        (
+                            item
+                            for item in self.schedules
+                            if item.id == assignment.get("entry_id")
+                        ),
+                        None,
+                    )
                     if first_entry_id is None and entry is not None:
                         first_entry_id = entry.id
+                    if (
+                        bool(assignment.get("cycle"))
+                        and len(assignment.get("paths") or []) > 1
+                    ):
+                        cycle_paths = [
+                            path
+                            for path in assignment.get("paths") or []
+                            if isinstance(path, Path)
+                        ]
+                        if len(cycle_paths) > 1:
+                            window.switch_to_image_cycle(
+                                cycle_paths,
+                                str(assignment.get("label") or cycle_paths[0].name),
+                                int(assignment.get("cycle_interval_seconds") or 10),
+                                play_at_ms=play_at_ms,
+                            )
+                            continue
                     window.switch_to_entry(
                         entry,
                         self.video_directory,
@@ -2794,20 +3345,36 @@ class PlaybackCoordinator(QWidget):
                         play_at_ms=play_at_ms,
                     )
                 else:
-                    if screen_id not in self.selected_monitor_ids and not is_remote_screen_id(screen_id) and screen_id not in self.virtual_screen_ids:
+                    if (
+                        screen_id not in self.selected_monitor_ids
+                        and not is_remote_screen_id(screen_id)
+                        and screen_id not in self.virtual_screen_ids
+                    ):
                         self.windows.pop(screen_id, None)
                         if isValid(window):
                             window.close()
                         continue
-                    window.clear_playback_at(str(assignment.get("message") or "No media scheduled for the current UK time."), play_at_ms)
+                    window.clear_playback_at(
+                        str(
+                            assignment.get("message")
+                            or "No media scheduled for the current UK time."
+                        ),
+                        play_at_ms,
+                    )
         for screen_id, assignment in assignments.items():
-            if assignment.get("type") == "play" and assignment.get("mode") == "schedule" and first_entry_id is None:
+            if (
+                assignment.get("type") == "play"
+                and assignment.get("mode") == "schedule"
+                and first_entry_id is None
+            ):
                 first_entry_id = str(assignment.get("entry_id") or "") or None
         if schedule_update:
             self.command_version += 1
             version = self.command_version
             for screen_id, assignment in assignments.items():
-                self.screen_commands[screen_id] = self.build_screen_command(screen_id, assignment, play_at_ms or current_timestamp_ms(), version)
+                self.screen_commands[screen_id] = self.build_screen_command(
+                    screen_id, assignment, play_at_ms or current_timestamp_ms(), version
+                )
             for screen_id in removed_screen_ids:
                 self.screen_commands.pop(screen_id, None)
             self.last_assignment_keys = assignment_keys
@@ -2818,7 +3385,9 @@ class PlaybackCoordinator(QWidget):
         self.schedule_next_update()
         self.playback_state_changed.emit(self.is_paused, len(self.windows))
 
-    def emit_status_for_current_time(self, weekday_index: int, minute_of_day: int) -> None:
+    def emit_status_for_current_time(
+        self, weekday_index: int, minute_of_day: int
+    ) -> None:
         clock_label, _minute, _weekday = current_uk_time()
         if not self.playback_enabled and not self.quick_play_paths:
             self.status_changed.emit(clock_label, "Playback stopped")
@@ -2826,12 +3395,25 @@ class PlaybackCoordinator(QWidget):
         active_entries = [
             entry
             for screen_id in self.selected_monitor_ids
-            if (entry := active_schedule_for_screen(self.schedules, weekday_index, minute_of_day, screen_id, self.screen_groups)) is not None
+            if (
+                entry := active_schedule_for_screen(
+                    self.schedules,
+                    weekday_index,
+                    minute_of_day,
+                    screen_id,
+                    self.screen_groups,
+                )
+            )
+            is not None
         ]
         if not active_entries:
             status = "No active schedule"
         else:
-            unique_labels = list(dict.fromkeys(f"{entry.title} • {entry.range_label}" for entry in active_entries))
+            unique_labels = list(
+                dict.fromkeys(
+                    f"{entry.title} • {entry.range_label}" for entry in active_entries
+                )
+            )
             if len(unique_labels) == 1:
                 status = unique_labels[0]
             else:
@@ -2849,38 +3431,32 @@ class PlaybackCoordinator(QWidget):
             self.schedule_timer.start(delay_ms)
 
     def next_schedule_change_delay_ms(self) -> int | None:
-        if not self.schedules:
-            return None
-        now = current_uk_datetime()
-        next_change: datetime | None = None
-        for entry in self.schedules:
-            start_minutes = ScheduleEntry.time_to_minutes(entry.start_time)
-            end_minutes = ScheduleEntry.time_to_minutes(entry.end_time)
-            for day_offset in range(8):
-                day_date = (now + timedelta(days=day_offset)).date()
-                day_key = DAY_INDEX_TO_KEY[day_date.weekday()]
-                if day_key not in entry.selected_days():
-                    continue
-                start_dt = datetime.combine(day_date, datetime.min.time(), tzinfo=UK_TZ) + timedelta(minutes=start_minutes)
-                if start_dt > now and (next_change is None or start_dt < next_change):
-                    next_change = start_dt
-                end_date = day_date if start_minutes < end_minutes else day_date + timedelta(days=1)
-                end_dt = datetime.combine(end_date, datetime.min.time(), tzinfo=UK_TZ) + timedelta(minutes=end_minutes)
-                if end_dt > now and (next_change is None or end_dt < next_change):
-                    next_change = end_dt
-        if next_change is None:
-            return None
-        return max(int((next_change - now).total_seconds() * 1000) + 50, 250)
+        return self.assignment_service.next_schedule_change_delay_ms(
+            schedules=self.schedules,
+            now=current_uk_datetime(),
+            tz=UK_TZ,
+        )
 
     def command_snapshots(self) -> dict[str, dict[str, Any]]:
-        return {screen_id: dict(command) for screen_id, command in self.screen_commands.items()}
+        return {
+            screen_id: command.to_engine_dict()
+            for screen_id, command in self.screen_commands.items()
+        }
 
     def remote_command_snapshots(self) -> dict[str, dict[str, Any]]:
-        return {screen_id: dict(command) for screen_id, command in self.screen_commands.items() if is_remote_screen_id(screen_id)}
+        return {
+            screen_id: command.to_engine_dict()
+            for screen_id, command in self.screen_commands.items()
+            if is_remote_screen_id(screen_id)
+        }
 
     def register_window(self, window: PlaybackWindow) -> None:
         self.windows[window.screen_id] = window
-        window.destroyed.connect(lambda *_args, screen_id=window.screen_id: self.on_window_destroyed(screen_id))
+        window.destroyed.connect(
+            lambda *_args, screen_id=window.screen_id: self.on_window_destroyed(
+                screen_id
+            )
+        )
 
     def on_window_destroyed(self, screen_id: str) -> None:
         self.windows.pop(screen_id, None)
@@ -2898,6 +3474,8 @@ class PlaybackCoordinator(QWidget):
 
 
 class LocalPlaybackWorkerController(QObject):
+    command_payload_received = Signal(object)
+
     def __init__(self, screen_id: str, parent: QObject | None = None) -> None:
         super().__init__(parent)
         screen = find_screen_by_id(screen_id)
@@ -2907,44 +3485,135 @@ class LocalPlaybackWorkerController(QObject):
         self.window = PlaybackWindow(screen, "Background Screen")
         self.window.show_on_screen()
         self.current_version = 0
-        self.poll_timer = QTimer(self)
-        self.poll_timer.setInterval(800)
-        self.poll_timer.timeout.connect(self.poll_once)
-        self.poll_timer.start()
-        QTimer.singleShot(0, self.poll_once)
+        self.current_command_type = "clear"
+        self.current_command_paused = False
+        self.command_payload_received.connect(self.on_command_payload_received)
+        self._stop_event = threading.Event()
+        self._subscription_thread: threading.Thread | None = None
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self.stop)
+        self.start_subscription_loop()
 
-    def poll_once(self) -> None:
-        try:
-            request = Request(
-                f"http://127.0.0.1:{LAN_SERVER_PORT}/api/remote/poll?screenId={quote(self.screen_id)}",
-                headers={"Accept": "application/json"},
-                method="GET",
+    def start_subscription_loop(self) -> None:
+        if (
+            self._subscription_thread is not None
+            and self._subscription_thread.is_alive()
+        ):
+            return
+        self._stop_event.clear()
+        self._subscription_thread = threading.Thread(
+            target=self._run_subscription_loop,
+            name=f"local-worker-subscription-{self.screen_id}",
+            daemon=True,
+        )
+        self._subscription_thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if (
+            self._subscription_thread is not None
+            and self._subscription_thread.is_alive()
+        ):
+            self._subscription_thread.join(timeout=1.0)
+        self._subscription_thread = None
+
+    def _run_subscription_loop(self) -> None:
+        client = ControllerApiClient()
+        while not self._stop_event.is_set():
+            try:
+                payload = client.wait_for_local_worker_command(
+                    self.screen_id,
+                    self.current_version,
+                    timeout=25.0,
+                )
+            except Exception:
+                if self._stop_event.wait(0.75):
+                    return
+                continue
+
+            command_payload = payload.get("command")
+            if not isinstance(command_payload, dict):
+                continue
+            if not payload.get("updated"):
+                continue
+            self.command_payload_received.emit(command_payload)
+
+    def on_command_payload_received(self, command_payload: object) -> None:
+        if not isinstance(command_payload, dict):
+            return
+        command = PlaybackCommand.from_payload(
+            command_payload, default_screen_id=self.screen_id
+        )
+        if command.protocol_version > COMMAND_PROTOCOL_VERSION:
+            append_engine_diagnostics_event(
+                "local_worker_protocol_mismatch",
+                severity="warning",
+                details="Unsupported command protocol version for local worker.",
+                context={
+                    "screenId": self.screen_id,
+                    "commandProtocolVersion": command.protocol_version,
+                    "supportedProtocolVersion": COMMAND_PROTOCOL_VERSION,
+                },
             )
-            with urlopen(request, timeout=1.5) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-        except Exception:
-            return
-        command = payload.get("command")
-        if not isinstance(command, dict):
-            return
-        version = int(command.get("version") or 0)
+            command = PlaybackCommand.clear(
+                self.screen_id,
+                version=max(1, int(command.version)),
+                message="Unsupported command protocol version.",
+            )
+
+        version = int(command.version or 0)
         if version == self.current_version:
             return
+
         self.current_version = version
+        self.current_command_type = command.command_type
+        self.current_command_paused = bool(command.paused)
         self.apply_command(command)
 
-    def apply_command(self, command: dict[str, Any]) -> None:
-        self.window.set_transition_method(str(command.get("transition") or "fade_black"))
-        self.window.set_paused(bool(command.get("paused")))
-        media_path = Path(str(command.get("path") or "")).expanduser() if command.get("path") else None
-        media_label = str(command.get("label") or (media_path.name if isinstance(media_path, Path) else ""))
-        play_at_ms = int(command.get("playAtMs") or 0) or None
-        if str(command.get("type") or "clear") != "play" or media_path is None or not media_path.exists():
-            message = str(command.get("message") or "")
+    def apply_command(self, command: PlaybackCommand) -> None:
+        self.window.set_transition_method(str(command.transition or "fade_black"))
+        self.window.set_paused(bool(command.paused))
+        media_path = Path(command.path).expanduser() if command.path else None
+        media_paths = [Path(item).expanduser() for item in command.paths if item]
+        media_label = command.label or (
+            media_path.name if isinstance(media_path, Path) else ""
+        )
+        play_at_ms = int(command.play_at_ms or 0) or None
+
+        if command.command_type != "play":
+            message = str(command.message or "")
             show_message = bool(message and "Missing media file" in message)
-            self.window.clear_playback_at(message, play_at_ms, show_message=show_message)
+            self.window.clear_playback_at(
+                message, play_at_ms, show_message=show_message
+            )
             return
-        self.window.switch_to_override(media_path, media_label or media_path.name, force_reload=True, play_at_ms=play_at_ms)
+
+        if bool(command.cycle) and len(media_paths) > 1:
+            valid_paths = [path for path in media_paths if path.exists()]
+            if len(valid_paths) > 1:
+                self.window.switch_to_image_cycle(
+                    valid_paths,
+                    media_label or valid_paths[0].name,
+                    int(command.cycle_interval_seconds or 10),
+                    play_at_ms=play_at_ms,
+                )
+                return
+
+        if media_path is None or not media_path.exists():
+            message = str(command.message or "")
+            show_message = bool(message and "Missing media file" in message)
+            self.window.clear_playback_at(
+                message, play_at_ms, show_message=show_message
+            )
+            return
+
+        self.window.switch_to_override(
+            media_path,
+            media_label or media_path.name,
+            force_reload=True,
+            play_at_ms=play_at_ms,
+        )
 
 
 class ElidedLabel(QLabel):
@@ -2966,7 +3635,11 @@ class ElidedLabel(QLabel):
             super().setText(self._full_text)
             return
         metrics = QFontMetrics(self.font())
-        super().setText(metrics.elidedText(self._full_text, Qt.TextElideMode.ElideRight, self.width() - 6))
+        super().setText(
+            metrics.elidedText(
+                self._full_text, Qt.TextElideMode.ElideRight, self.width() - 6
+            )
+        )
 
 
 class MediaPickerDialog(QDialog):
@@ -2978,6 +3651,7 @@ class MediaPickerDialog(QDialog):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        apply_dialog_theme(self)
         self.media_files = media_files[:]
         self.media_directory = media_directory
         self.selected_file = selected_file
@@ -3025,7 +3699,9 @@ class MediaPickerDialog(QDialog):
         self.preview_stack = QFrame()
         self.preview_stack.setStyleSheet("background: #0c1015; border-radius: 16px;")
         self.preview_stack.setMinimumHeight(320)
-        self.preview_stack.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.preview_stack.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
         preview_layout.addWidget(self.preview_stack, 1)
 
         self.video_preview = QVideoWidget(self.preview_stack)
@@ -3046,7 +3722,9 @@ class MediaPickerDialog(QDialog):
         preview_layout.addWidget(self.preview_name_label)
         preview_layout.addWidget(self.preview_path_label)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok
+        )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -3095,8 +3773,12 @@ class MediaPickerDialog(QDialog):
         self.player.stop()
         super().accept()
 
-    def on_item_changed(self, current: QListWidgetItem | None, previous: QListWidgetItem | None) -> None:
-        selected = "" if current is None else str(current.data(Qt.ItemDataRole.UserRole) or "")
+    def on_item_changed(
+        self, current: QListWidgetItem | None, previous: QListWidgetItem | None
+    ) -> None:
+        selected = (
+            "" if current is None else str(current.data(Qt.ItemDataRole.UserRole) or "")
+        )
         self.selected_path = selected
         if not selected or self.media_directory is None:
             self.player.stop()
@@ -3116,7 +3798,9 @@ class MediaPickerDialog(QDialog):
             self.video_preview.hide()
             self.image_preview.show()
             self.preview_message.setText("Image preview")
-            self.preview_pixmap = load_pixmap_for_bounds(media_path, self.image_preview.size())
+            self.preview_pixmap = load_pixmap_for_bounds(
+                media_path, self.image_preview.size()
+            )
             self.update_image_preview()
             return
 
@@ -3144,8 +3828,11 @@ class MediaPickerDialog(QDialog):
 
 
 class TimePickerDialog(QDialog):
-    def __init__(self, title: str, initial_time: QTime, parent: QWidget | None = None) -> None:
+    def __init__(
+        self, title: str, initial_time: QTime, parent: QWidget | None = None
+    ) -> None:
         super().__init__(parent)
+        apply_dialog_theme(self)
         self.setWindowFlags(Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
         self.setModal(True)
         self.setObjectName("timePopup")
@@ -3170,7 +3857,9 @@ class TimePickerDialog(QDialog):
         self.hour_list = QListWidget()
         self.hour_list.setObjectName("timePickerList")
         self.hour_list.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
-        self.hour_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.hour_list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
         self.hour_list.setSpacing(2)
         self.hour_list.setFixedWidth(74)
         self.hour_list.setFixedHeight(220)
@@ -3178,7 +3867,9 @@ class TimePickerDialog(QDialog):
         self.minute_list = QListWidget()
         self.minute_list.setObjectName("timePickerList")
         self.minute_list.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
-        self.minute_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.minute_list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
         self.minute_list.setSpacing(2)
         self.minute_list.setFixedWidth(74)
         self.minute_list.setFixedHeight(220)
@@ -3218,7 +3909,8 @@ class TimePickerDialog(QDialog):
         hint_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(hint_label)
 
-        self.setStyleSheet(
+        apply_dialog_theme(
+            self,
             """
             QDialog#timePopup {
                 background: #ffffff;
@@ -3255,15 +3947,19 @@ class TimePickerDialog(QDialog):
                 border: 1px solid rgba(93,183,240,0.72);
                 color: #102b3d;
             }
-            """
+            """,
         )
         self.resize(206, 338)
         QTimer.singleShot(0, self._prime_focus)
 
     def _prime_focus(self) -> None:
         self.hour_list.setFocus()
-        self.hour_list.scrollToItem(self.hour_list.currentItem(), QListWidget.ScrollHint.PositionAtCenter)
-        self.minute_list.scrollToItem(self.minute_list.currentItem(), QListWidget.ScrollHint.PositionAtCenter)
+        self.hour_list.scrollToItem(
+            self.hour_list.currentItem(), QListWidget.ScrollHint.PositionAtCenter
+        )
+        self.minute_list.scrollToItem(
+            self.minute_list.currentItem(), QListWidget.ScrollHint.PositionAtCenter
+        )
 
     def on_time_part_changed(self, _row: int = -1) -> None:
         hour = max(self.hour_list.currentRow(), 0)
@@ -3284,6 +3980,7 @@ class QuickPlayTargetDialog(QDialog):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        apply_dialog_theme(self)
         self.setWindowTitle("Choose Quick Play Screens")
         self.setModal(True)
         self.resize(360, 280)
@@ -3295,7 +3992,9 @@ class QuickPlayTargetDialog(QDialog):
 
         title = QLabel("Choose where to play the dropped media")
         title.setObjectName("sectionTitle")
-        body = QLabel(f"{media_name} will override scheduled playback on the chosen screen(s).")
+        body = QLabel(
+            f"{media_name} will override scheduled playback on the chosen screen(s)."
+        )
         body.setObjectName("sectionDescription")
         body.setWordWrap(True)
         layout.addWidget(title)
@@ -3306,22 +4005,34 @@ class QuickPlayTargetDialog(QDialog):
         list_layout.setContentsMargins(0, 0, 0, 0)
         list_layout.setSpacing(8)
         for target in targets:
-            checkbox = QCheckBox(target.label if target.online else f"{target.label} (offline)")
-            checkbox.setChecked(target.id in selected_monitor_ids if selected_monitor_ids else len(self.screen_checkboxes) == 0)
+            checkbox = QCheckBox(
+                target.label if target.online else f"{target.label} (offline)"
+            )
+            checkbox.setChecked(
+                target.id in selected_monitor_ids
+                if selected_monitor_ids
+                else len(self.screen_checkboxes) == 0
+            )
             checkbox.setToolTip(target.detail or target.label)
             self.screen_checkboxes[target.id] = checkbox
             list_layout.addWidget(checkbox)
         list_layout.addStretch(1)
         layout.addWidget(list_holder, 1)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok
+        )
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Start Quick Play")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
     def selected_screen_ids(self) -> list[str]:
-        return [screen_id for screen_id, checkbox in self.screen_checkboxes.items() if checkbox.isChecked()]
+        return [
+            screen_id
+            for screen_id, checkbox in self.screen_checkboxes.items()
+            if checkbox.isChecked()
+        ]
 
 
 class ConfiguredScreenEditorDialog(QDialog):
@@ -3329,15 +4040,14 @@ class ConfiguredScreenEditorDialog(QDialog):
         self,
         screen: ConfiguredScreen | None = None,
         remote_screens: dict[str, dict[str, Any]] | None = None,
-        dlna_devices: dict[str, dict[str, Any]] | None = None,
-        miracast_devices: dict[str, dict[str, Any]] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        apply_dialog_theme(self)
         self.screen = screen
-        self.remote_screens = {str(key): dict(value) for key, value in (remote_screens or {}).items()}
-        self.dlna_devices = {str(key): dict(value) for key, value in (dlna_devices or {}).items()}
-        self.miracast_devices = {str(key): dict(value) for key, value in (miracast_devices or {}).items()}
+        self.remote_screens = {
+            str(key): dict(value) for key, value in (remote_screens or {}).items()
+        }
         self.setWindowTitle("Configured Screen")
         self.setModal(True)
         self.resize(520, 420)
@@ -3349,7 +4059,9 @@ class ConfiguredScreenEditorDialog(QDialog):
 
         title = QLabel("Define a screen and the protocol it must use")
         title.setObjectName("sectionTitle")
-        body = QLabel("This phase stores the screen contract now. Later phases will bind each protocol to real playback and discovery.")
+        body = QLabel(
+            "This phase stores the screen contract now. Later phases will bind each protocol to real playback and discovery."
+        )
         body.setObjectName("sectionDescription")
         body.setWordWrap(True)
         layout.addWidget(title)
@@ -3361,11 +4073,15 @@ class ConfiguredScreenEditorDialog(QDialog):
         form.addRow("Name", self.name_edit)
         self.transport_selector = QComboBox(self)
         for transport in SCREEN_TRANSPORTS:
-            self.transport_selector.addItem(TRANSPORT_LABELS.get(transport, transport), transport)
+            self.transport_selector.addItem(
+                TRANSPORT_LABELS.get(transport, transport), transport
+            )
         self.transport_selector.currentIndexChanged.connect(self.on_transport_changed)
         form.addRow("Protocol", self.transport_selector)
         self.binding_edit = QLineEdit(self)
-        self.binding_edit.setPlaceholderText("Optional device id, receiver id, or protocol-specific binding")
+        self.binding_edit.setPlaceholderText(
+            "Optional device id, receiver id, or protocol-specific binding"
+        )
         form.addRow("Binding", self.binding_edit)
         layout.addLayout(form)
 
@@ -3382,7 +4098,9 @@ class ConfiguredScreenEditorDialog(QDialog):
         capability_layout.setHorizontalSpacing(12)
         capability_layout.setVerticalSpacing(8)
         for index, capability in enumerate(SCREEN_CAPABILITIES):
-            checkbox = QCheckBox(CAPABILITY_LABELS.get(capability, capability), capability_holder)
+            checkbox = QCheckBox(
+                CAPABILITY_LABELS.get(capability, capability), capability_holder
+            )
             self.capability_checks[capability] = checkbox
             capability_layout.addWidget(checkbox, index // 2, index % 2)
         layout.addWidget(capability_holder)
@@ -3392,14 +4110,18 @@ class ConfiguredScreenEditorDialog(QDialog):
         self.message_label.hide()
         layout.addWidget(self.message_label)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok
+        )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
         if screen is not None:
             self.name_edit.setText(screen.name)
-            initial_binding = browser_binding_remote_id(screen) or dlna_binding_usn(screen) or miracast_binding_device_id(screen) or screen.binding.get("value", "")
+            initial_binding = browser_binding_remote_id(screen) or screen.binding.get(
+                "value", ""
+            )
             self.binding_edit.setText(initial_binding)
             selected_index = self.transport_selector.findData(screen.transport)
             if selected_index >= 0:
@@ -3415,7 +4137,9 @@ class ConfiguredScreenEditorDialog(QDialog):
     def on_transport_changed(self) -> None:
         transport = str(self.transport_selector.currentData() or "")
         supported = set(supported_capabilities(transport))
-        should_seed_defaults = self.screen is None and not any(item.isChecked() for item in self.capability_checks.values())
+        should_seed_defaults = self.screen is None and not any(
+            item.isChecked() for item in self.capability_checks.values()
+        )
         for capability, checkbox in self.capability_checks.items():
             allowed = capability in supported
             checkbox.setEnabled(allowed)
@@ -3427,31 +4151,21 @@ class ConfiguredScreenEditorDialog(QDialog):
 
     def refresh_transport_binding_selector(self) -> None:
         transport = str(self.transport_selector.currentData() or "")
-        self.binding_selector.setVisible(transport in {"browser", "dlna", "miracast"})
-        if transport not in {"browser", "dlna", "miracast"}:
+        self.binding_selector.setVisible(transport == "browser")
+        if transport != "browser":
             return
         self.binding_selector.blockSignals(True)
         self.binding_selector.clear()
-        if transport == "browser":
-            self.binding_selector.addItem("Bind manually or choose a connected browser receiver", "")
-            for screen_id, state in sorted(self.remote_screens.items(), key=lambda item: friendly_remote_name(item[0], {}, item[1]).lower()):
-                online_text = "online" if state.get("online") else "offline"
-                label = f"{friendly_remote_name(screen_id, {}, state)} ({online_text})"
-                self.binding_selector.addItem(label, screen_id)
-        elif transport == "dlna":
-            self.binding_selector.addItem("Bind manually or choose a discovered DLNA renderer", "")
-            for usn, device in sorted(self.dlna_devices.items(), key=lambda item: str(item[1].get("friendly_name") or item[0]).lower()):
-                name = str(device.get("friendly_name") or usn)
-                ip = str(device.get("ip") or "")
-                label = f"{name} ({ip})" if ip else name
-                self.binding_selector.addItem(label, usn)
-        elif transport == "miracast":
-            self.binding_selector.addItem("Bind manually or choose a discovered Miracast device", "")
-            for device_id, device in sorted(self.miracast_devices.items(), key=lambda item: str(item[1].get("friendly_name") or item[0]).lower()):
-                name = str(device.get("friendly_name") or device_id)
-                detail = str(device.get("detail") or "")
-                label = f"{name} ({detail})" if detail else name
-                self.binding_selector.addItem(label, device_id)
+        self.binding_selector.addItem(
+            "Bind manually or choose a connected browser receiver", ""
+        )
+        for screen_id, state in sorted(
+            self.remote_screens.items(),
+            key=lambda item: friendly_remote_name(item[0], {}, item[1]).lower(),
+        ):
+            online_text = "online" if state.get("online") else "offline"
+            label = f"{friendly_remote_name(screen_id, {}, state)} ({online_text})"
+            self.binding_selector.addItem(label, screen_id)
         current_binding = self.binding_edit.text().strip()
         if current_binding:
             index = self.binding_selector.findData(current_binding)
@@ -3465,7 +4179,11 @@ class ConfiguredScreenEditorDialog(QDialog):
             self.binding_edit.setText(binding_value)
 
     def selected_capabilities(self) -> list[str]:
-        return [capability for capability, checkbox in self.capability_checks.items() if checkbox.isChecked()]
+        return [
+            capability
+            for capability, checkbox in self.capability_checks.items()
+            if checkbox.isChecked()
+        ]
 
     def build_screen(self) -> ConfiguredScreen:
         binding_value = self.binding_edit.text().strip()
@@ -3474,10 +4192,6 @@ class ConfiguredScreenEditorDialog(QDialog):
         if binding_value:
             if transport == "browser":
                 binding = {BROWSER_BINDING_KEY: binding_value}
-            elif transport == "dlna":
-                binding = {DLNA_BINDING_KEY: binding_value}
-            elif transport == "miracast":
-                binding = {MIRACAST_BINDING_KEY: binding_value}
             else:
                 binding = {"value": binding_value}
         screen = ConfiguredScreen(
@@ -3506,15 +4220,16 @@ class ConfiguredScreenManagerDialog(QDialog):
         self,
         screens: list[ConfiguredScreen],
         remote_screens: dict[str, dict[str, Any]] | None = None,
-        dlna_devices: dict[str, dict[str, Any]] | None = None,
-        miracast_devices: dict[str, dict[str, Any]] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self._screens = [ConfiguredScreen.from_dict(screen.to_dict()) for screen in screens]
-        self.remote_screens = {str(key): dict(value) for key, value in (remote_screens or {}).items()}
-        self.dlna_devices = {str(key): dict(value) for key, value in (dlna_devices or {}).items()}
-        self.miracast_devices = {str(key): dict(value) for key, value in (miracast_devices or {}).items()}
+        apply_dialog_theme(self)
+        self._screens = [
+            ConfiguredScreen.from_dict(screen.to_dict()) for screen in screens
+        ]
+        self.remote_screens = {
+            str(key): dict(value) for key, value in (remote_screens or {}).items()
+        }
         self.setWindowTitle("Configured Screens")
         self.setModal(True)
         self.resize(720, 440)
@@ -3525,14 +4240,18 @@ class ConfiguredScreenManagerDialog(QDialog):
 
         title = QLabel("Configured Screens")
         title.setObjectName("sectionTitle")
-        body = QLabel("Each screen keeps an explicit protocol and capability contract. Unsupported combinations are blocked before they can be saved.")
+        body = QLabel(
+            "Each screen keeps an explicit protocol and capability contract. Unsupported combinations are blocked before they can be saved."
+        )
         body.setObjectName("sectionDescription")
         body.setWordWrap(True)
         layout.addWidget(title)
         layout.addWidget(body)
 
         self.screen_list = QListWidget(self)
-        self.screen_list.itemDoubleClicked.connect(lambda _item: self.edit_selected_screen())
+        self.screen_list.itemDoubleClicked.connect(
+            lambda _item: self.edit_selected_screen()
+        )
         layout.addWidget(self.screen_list, 1)
 
         button_row = QHBoxLayout()
@@ -3549,7 +4268,11 @@ class ConfiguredScreenManagerDialog(QDialog):
         button_row.addStretch(1)
         layout.addLayout(button_row)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Save, parent=self)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel
+            | QDialogButtonBox.StandardButton.Save,
+            parent=self,
+        )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -3573,8 +4296,6 @@ class ConfiguredScreenManagerDialog(QDialog):
     def add_screen(self) -> None:
         dialog = ConfiguredScreenEditorDialog(
             remote_screens=self.remote_screens,
-            dlna_devices=self.dlna_devices,
-            miracast_devices=self.miracast_devices,
             parent=self,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -3586,7 +4307,9 @@ class ConfiguredScreenManagerDialog(QDialog):
         index = self.selected_index()
         if index < 0 or index >= len(self._screens):
             return
-        dialog = ConfiguredScreenEditorDialog(self._screens[index], self.remote_screens, self.dlna_devices, self.miracast_devices, self)
+        dialog = ConfiguredScreenEditorDialog(
+            self._screens[index], self.remote_screens, self
+        )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self._screens[index] = dialog.build_screen()
@@ -3603,7 +4326,9 @@ class ConfiguredScreenManagerDialog(QDialog):
             self.screen_list.setCurrentRow(min(index, self.screen_list.count() - 1))
 
     def configured_screens(self) -> list[ConfiguredScreen]:
-        return [ConfiguredScreen.from_dict(screen.to_dict()) for screen in self._screens]
+        return [
+            ConfiguredScreen.from_dict(screen.to_dict()) for screen in self._screens
+        ]
 
 
 class ScreenGroupEditorDialog(QDialog):
@@ -3614,8 +4339,11 @@ class ScreenGroupEditorDialog(QDialog):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        apply_dialog_theme(self)
         self.group = group
-        self.targets = [target for target in targets if not is_group_target_id(target.id)]
+        self.targets = [
+            target for target in targets if not is_group_target_id(target.id)
+        ]
         self.checkboxes: dict[str, QCheckBox] = {}
         self.setWindowTitle("Screen Group")
         self.setModal(True)
@@ -3645,7 +4373,10 @@ class ScreenGroupEditorDialog(QDialog):
         self.message_label.setObjectName("messageBanner")
         self.message_label.hide()
         layout.addWidget(self.message_label)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok, parent=self)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok,
+            parent=self,
+        )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -3656,7 +4387,11 @@ class ScreenGroupEditorDialog(QDialog):
         group = ScreenGroup(
             id=self.group.id if self.group is not None else f"group:{uuid.uuid4().hex}",
             name=self.name_edit.text().strip(),
-            screen_ids=[screen_id for screen_id, checkbox in self.checkboxes.items() if checkbox.isChecked()],
+            screen_ids=[
+                screen_id
+                for screen_id, checkbox in self.checkboxes.items()
+                if checkbox.isChecked()
+            ],
         )
         group.validate()
         return group
@@ -3677,8 +4412,14 @@ class ScreenGroupEditorDialog(QDialog):
 
 
 class ScreenGroupManagerDialog(QDialog):
-    def __init__(self, groups: list[ScreenGroup], targets: list[UnifiedScreenTarget], parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        groups: list[ScreenGroup],
+        targets: list[UnifiedScreenTarget],
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
+        apply_dialog_theme(self)
         self._groups = [ScreenGroup.from_dict(group.to_dict()) for group in groups]
         self.targets = targets[:]
         self.setWindowTitle("Screen Groups")
@@ -3690,13 +4431,17 @@ class ScreenGroupManagerDialog(QDialog):
         layout.setSpacing(12)
         title = QLabel("Screen Groups")
         title.setObjectName("sectionTitle")
-        body = QLabel("Use groups to target a set of screens from schedule slots without selecting each screen one by one.")
+        body = QLabel(
+            "Use groups to target a set of screens from schedule slots without selecting each screen one by one."
+        )
         body.setObjectName("sectionDescription")
         body.setWordWrap(True)
         layout.addWidget(title)
         layout.addWidget(body)
         self.group_list = QListWidget(self)
-        self.group_list.itemDoubleClicked.connect(lambda _item: self.edit_selected_group())
+        self.group_list.itemDoubleClicked.connect(
+            lambda _item: self.edit_selected_group()
+        )
         layout.addWidget(self.group_list, 1)
         buttons_row = QHBoxLayout()
         add_button = QPushButton("Add", self)
@@ -3711,7 +4456,11 @@ class ScreenGroupManagerDialog(QDialog):
         buttons_row.addWidget(delete_button)
         buttons_row.addStretch(1)
         layout.addLayout(buttons_row)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Save, parent=self)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel
+            | QDialogButtonBox.StandardButton.Save,
+            parent=self,
+        )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -3759,6 +4508,591 @@ class ScreenGroupManagerDialog(QDialog):
         return [ScreenGroup.from_dict(group.to_dict()) for group in self._groups]
 
 
+class ManageScreensWorkspaceDialog(QDialog):
+    def __init__(
+        self,
+        targets: list[UnifiedScreenTarget],
+        selected_monitor_ids: list[str],
+        enabled_screen_ids: list[str],
+        screen_aliases: dict[str, str],
+        merge_handler: Callable[[str, str], tuple[bool, str]] | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        apply_dialog_theme(self)
+        self.setWindowTitle("Manage Screens")
+        self.setModal(True)
+        self.resize(920, 560)
+        self.all_targets = targets[:]
+        self.targets: list[UnifiedScreenTarget] = []
+        self.selected_monitor_ids = set(selected_monitor_ids)
+        self.enabled_screen_ids = set(enabled_screen_ids)
+        self.screen_aliases = dict(screen_aliases)
+        self._active_row = -1
+        self._updating_fields = False
+        self.merge_handler = merge_handler
+
+        apply_dialog_theme(
+            self,
+            """
+            QLabel#manageScreensFieldLabel { color: #112c40; font-size: 13px; font-weight: 650; }
+            QLabel#manageScreensDetail { color: rgba(23,48,67,0.90); font-size: 12px; }
+            """,
+        )
+
+        layout = QVBoxLayout(self)
+        header = QLabel("Configure local HDMI and LAN screens in one place")
+        header.setObjectName("sectionDescription")
+        layout.addWidget(header)
+
+        body = QHBoxLayout()
+
+        list_column = QVBoxLayout()
+        search_row = QHBoxLayout()
+        self.search_input = QLineEdit(self)
+        self.search_input.setPlaceholderText("Search screens by name, ID, or details")
+        self.filter_selector = QComboBox(self)
+        self.filter_selector.addItem("All", "all")
+        self.filter_selector.addItem("Local", "local")
+        self.filter_selector.addItem("Remote", "remote")
+        self.filter_selector.addItem("Online", "online")
+        self.filter_selector.addItem("Offline", "offline")
+        self.filter_selector.addItem("Enabled", "enabled")
+        self.filter_selector.addItem("Default Group", "default")
+        search_row.addWidget(self.search_input, 1)
+        search_row.addWidget(self.filter_selector, 0)
+        list_column.addLayout(search_row)
+
+        bulk_row = QHBoxLayout()
+        self.enable_visible_button = QPushButton("Enable Visible")
+        self.disable_visible_button = QPushButton("Disable Visible")
+        self.select_visible_button = QPushButton("Default Visible")
+        self.unselect_visible_button = QPushButton("Clear Visible")
+        bulk_row.addWidget(self.enable_visible_button)
+        bulk_row.addWidget(self.disable_visible_button)
+        bulk_row.addWidget(self.select_visible_button)
+        bulk_row.addWidget(self.unselect_visible_button)
+        list_column.addLayout(bulk_row)
+
+        self.screen_list = QListWidget(self)
+        self.screen_list.setMinimumWidth(360)
+        self.screen_list.currentRowChanged.connect(self.on_screen_selected)
+        list_column.addWidget(self.screen_list, 1)
+
+        body.addLayout(list_column, 1)
+
+        detail = QVBoxLayout()
+        self.name_input = QLineEdit(self)
+        self.enabled_checkbox = QCheckBox(
+            "Enable this screen for scheduling (even if offline)", self
+        )
+        self.default_checkbox = QCheckBox("Include in default playback group", self)
+        self.detail_label = QLabel("Select a screen")
+        self.detail_label.setObjectName("manageScreensDetail")
+        self.detail_label.setWordWrap(True)
+        screen_name_label = QLabel("Screen Name")
+        screen_name_label.setObjectName("manageScreensFieldLabel")
+        detail.addWidget(screen_name_label)
+        detail.addWidget(self.name_input)
+        detail.addWidget(self.enabled_checkbox)
+        detail.addWidget(self.default_checkbox)
+        detail.addWidget(self.detail_label)
+
+        merge_label = QLabel("Merge remembered duplicate LAN screens")
+        merge_label.setObjectName("manageScreensFieldLabel")
+        self.merge_source_selector = QComboBox(self)
+        self.merge_target_selector = QComboBox(self)
+        self.merge_apply_button = QPushButton("Merge into Target")
+        self.merge_feedback_label = QLabel("")
+        self.merge_feedback_label.setObjectName("manageScreensDetail")
+        self.merge_feedback_label.setWordWrap(True)
+        detail.addWidget(merge_label)
+        detail.addWidget(self.merge_source_selector)
+        detail.addWidget(self.merge_target_selector)
+        detail.addWidget(self.merge_apply_button)
+        detail.addWidget(self.merge_feedback_label)
+
+        detail.addStretch(1)
+        body.addLayout(detail, 1)
+        layout.addLayout(body, 1)
+
+        controls = QHBoxLayout()
+        self.manage_groups_button = QPushButton("Manage Groups...")
+        self.manage_configured_button = QPushButton("Configured Screens...")
+        self.refresh_button = QPushButton("Refresh")
+        self.merge_duplicates_button = QPushButton("Merge Duplicates...")
+        self.purge_offline_button = QPushButton("Purge Offline")
+        self.purge_all_button = QPushButton("Purge All")
+        self.apply_button = QPushButton("Apply")
+        self.apply_button.setProperty("variant", "primary")
+        controls.addWidget(self.manage_groups_button)
+        controls.addWidget(self.manage_configured_button)
+        controls.addWidget(self.refresh_button)
+        controls.addWidget(self.merge_duplicates_button)
+        controls.addWidget(self.purge_offline_button)
+        controls.addWidget(self.purge_all_button)
+        controls.addStretch(1)
+        controls.addWidget(self.apply_button)
+        layout.addLayout(controls)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=self)
+        buttons.rejected.connect(self.reject)
+        buttons.accepted.connect(self.accept)
+        buttons.button(QDialogButtonBox.StandardButton.Close).clicked.connect(
+            self.accept
+        )
+        layout.addWidget(buttons)
+
+        self.apply_button.clicked.connect(self.apply_current)
+        self.name_input.editingFinished.connect(self.apply_current)
+        self.enabled_checkbox.toggled.connect(lambda _checked: self.apply_current())
+        self.default_checkbox.toggled.connect(lambda _checked: self.apply_current())
+        self.search_input.textChanged.connect(lambda _value: self.populate_list())
+        self.filter_selector.currentIndexChanged.connect(
+            lambda _idx: self.populate_list()
+        )
+        self.enable_visible_button.clicked.connect(
+            lambda *_args: self._bulk_set_visible(enabled=True)
+        )
+        self.disable_visible_button.clicked.connect(
+            lambda *_args: self._bulk_set_visible(enabled=False)
+        )
+        self.select_visible_button.clicked.connect(
+            lambda *_args: self._bulk_set_visible(default_selected=True)
+        )
+        self.unselect_visible_button.clicked.connect(
+            lambda *_args: self._bulk_set_visible(default_selected=False)
+        )
+        self.merge_source_selector.currentIndexChanged.connect(
+            lambda _idx: self._sync_merge_targets()
+        )
+        self.merge_apply_button.clicked.connect(self._apply_merge_from_workspace)
+        self.populate_list()
+        self._refresh_merge_controls()
+
+    def replace_targets(self, targets: list[UnifiedScreenTarget]) -> None:
+        self.apply_current()
+        self.all_targets = targets[:]
+        self.populate_list()
+        self._refresh_merge_controls()
+
+    def sync_state(
+        self,
+        *,
+        selected_monitor_ids: list[str],
+        enabled_screen_ids: list[str],
+        screen_aliases: dict[str, str],
+    ) -> None:
+        self.selected_monitor_ids = set(selected_monitor_ids)
+        self.enabled_screen_ids = set(enabled_screen_ids)
+        self.screen_aliases = dict(screen_aliases)
+        self.populate_list()
+        self._refresh_merge_controls()
+
+    def _filter_key(self) -> str:
+        return str(self.filter_selector.currentData() or "all")
+
+    def _target_matches_filters(
+        self, target: UnifiedScreenTarget, query: str, key: str
+    ) -> bool:
+        if key == "local" and target.kind != "local":
+            return False
+        if key == "remote" and target.kind != "remote":
+            return False
+        if key == "online" and not target.online:
+            return False
+        if key == "offline" and target.online:
+            return False
+        if key == "enabled" and target.id not in self.enabled_screen_ids:
+            return False
+        if key == "default" and target.id not in self.selected_monitor_ids:
+            return False
+        if not query:
+            return True
+        haystack = " ".join(
+            [
+                target.id,
+                target.label,
+                self.screen_aliases.get(target.id, ""),
+                target.detail,
+                target.warning,
+            ]
+        ).lower()
+        return query in haystack
+
+    def populate_list(self) -> None:
+        self._apply_row(self._active_row)
+        selected_screen_id = ""
+        current_row = self.screen_list.currentRow()
+        if 0 <= current_row < len(self.targets):
+            selected_screen_id = self.targets[current_row].id
+
+        query = self.search_input.text().strip().lower()
+        filter_key = self._filter_key()
+        self.targets = [
+            target
+            for target in sorted(
+                self.all_targets,
+                key=lambda t: (0 if t.online else 1, t.kind, t.label.lower()),
+            )
+            if self._target_matches_filters(target, query, filter_key)
+        ]
+
+        self.screen_list.blockSignals(True)
+        self.screen_list.clear()
+        for target in self.targets:
+            source_icon = "🖥️" if target.kind == "local" else "🌐"
+            state = "online" if target.online else "offline"
+            enabled = "enabled" if target.id in self.enabled_screen_ids else "disabled"
+            default = "default" if target.id in self.selected_monitor_ids else ""
+            suffix = ", ".join(part for part in [enabled, default] if part)
+            item = QListWidgetItem(
+                f"{source_icon} {target.label} ({state}{' • ' + suffix if suffix else ''})"
+            )
+            item.setData(Qt.ItemDataRole.UserRole, target.id)
+            self.screen_list.addItem(item)
+        self.screen_list.blockSignals(False)
+
+        if self.screen_list.count() <= 0:
+            self._active_row = -1
+            self.detail_label.setText("No screens match the current filters.")
+            return
+
+        next_row = 0
+        if selected_screen_id:
+            for idx, target in enumerate(self.targets):
+                if target.id == selected_screen_id:
+                    next_row = idx
+                    break
+        self.screen_list.setCurrentRow(next_row)
+
+    def on_screen_selected(self, row: int) -> None:
+        self._apply_row(self._active_row)
+        self._active_row = row
+        if row < 0 or row >= len(self.targets):
+            return
+        target = self.targets[row]
+        self._updating_fields = True
+        try:
+            self.name_input.setText(self.screen_aliases.get(target.id, target.label))
+            self.enabled_checkbox.setChecked(target.id in self.enabled_screen_ids)
+            self.default_checkbox.setChecked(target.id in self.selected_monitor_ids)
+            self.detail_label.setText(
+                f"{target.detail}\n\n{target.warning or ''}".strip()
+            )
+        finally:
+            self._updating_fields = False
+
+    def _apply_row(self, row: int) -> None:
+        if self._updating_fields:
+            return
+        if row < 0 or row >= len(self.targets):
+            return
+        target = self.targets[row]
+        name = self.name_input.text().strip()
+        if name:
+            self.screen_aliases[target.id] = name
+        else:
+            self.screen_aliases.pop(target.id, None)
+        if self.enabled_checkbox.isChecked():
+            self.enabled_screen_ids.add(target.id)
+        else:
+            self.enabled_screen_ids.discard(target.id)
+        if self.default_checkbox.isChecked():
+            self.selected_monitor_ids.add(target.id)
+        else:
+            self.selected_monitor_ids.discard(target.id)
+
+    def _bulk_set_visible(
+        self,
+        *,
+        enabled: bool | None = None,
+        default_selected: bool | None = None,
+    ) -> None:
+        self.apply_current()
+        for target in self.targets:
+            if enabled is not None:
+                if enabled:
+                    self.enabled_screen_ids.add(target.id)
+                else:
+                    self.enabled_screen_ids.discard(target.id)
+            if default_selected is not None:
+                if default_selected:
+                    self.selected_monitor_ids.add(target.id)
+                else:
+                    self.selected_monitor_ids.discard(target.id)
+        self.populate_list()
+
+    def _merge_candidate_ids(self) -> list[str]:
+        return sorted(
+            target.id
+            for target in self.all_targets
+            if target.kind == "remote" and is_remote_screen_id(target.id)
+        )
+
+    def _refresh_merge_controls(self) -> None:
+        candidates = self._merge_candidate_ids()
+        self.merge_source_selector.blockSignals(True)
+        self.merge_source_selector.clear()
+        for screen_id in candidates:
+            label = self.screen_aliases.get(screen_id) or screen_id
+            self.merge_source_selector.addItem(f"{label} ({screen_id})", screen_id)
+        self.merge_source_selector.blockSignals(False)
+        self._sync_merge_targets()
+
+    def _sync_merge_targets(self) -> None:
+        source_id = str(self.merge_source_selector.currentData() or "")
+        candidates = [
+            screen_id
+            for screen_id in self._merge_candidate_ids()
+            if screen_id != source_id
+        ]
+        self.merge_target_selector.clear()
+        for screen_id in candidates:
+            label = self.screen_aliases.get(screen_id) or screen_id
+            self.merge_target_selector.addItem(f"{label} ({screen_id})", screen_id)
+        enabled = bool(source_id and candidates and self.merge_handler is not None)
+        self.merge_source_selector.setEnabled(bool(self._merge_candidate_ids()))
+        self.merge_target_selector.setEnabled(enabled)
+        self.merge_apply_button.setEnabled(enabled)
+        if not enabled:
+            if len(self._merge_candidate_ids()) < 2:
+                self.merge_feedback_label.setText(
+                    "Need at least two remembered remote screens to merge."
+                )
+            elif self.merge_handler is None:
+                self.merge_feedback_label.setText("Merge action is unavailable.")
+
+    def _apply_merge_from_workspace(self) -> None:
+        source_id = str(self.merge_source_selector.currentData() or "").strip()
+        target_id = str(self.merge_target_selector.currentData() or "").strip()
+        if not source_id or not target_id or source_id == target_id:
+            self.merge_feedback_label.setText(
+                "Choose distinct source and target screens."
+            )
+            return
+        if self.merge_handler is None:
+            self.merge_feedback_label.setText("Merge action is unavailable.")
+            return
+        merged, message = self.merge_handler(source_id, target_id)
+        self.merge_feedback_label.setText(message)
+        if not merged:
+            return
+        self.selected_monitor_ids.discard(source_id)
+        self.enabled_screen_ids.discard(source_id)
+        self.screen_aliases.pop(source_id, None)
+        self.all_targets = [
+            target for target in self.all_targets if target.id != source_id
+        ]
+        self.populate_list()
+        self._refresh_merge_controls()
+
+    def apply_current(self) -> None:
+        self._apply_row(self.screen_list.currentRow())
+        self._refresh_merge_controls()
+
+    def accept(self) -> None:  # type: ignore[override]
+        self.apply_current()
+        super().accept()
+
+
+def markdown_sections(markdown_text: str) -> list[tuple[str, str]]:
+    lines = markdown_text.splitlines()
+    sections: list[tuple[str, list[str]]] = []
+    current_title = "Overview"
+    current_lines: list[str] = []
+    for line in lines:
+        if line.startswith("## "):
+            if current_lines:
+                sections.append((current_title, current_lines[:]))
+            current_title = line[3:].strip()
+            current_lines = []
+            continue
+        if line.startswith("# "):
+            continue
+        current_lines.append(line)
+    if current_lines:
+        sections.append((current_title, current_lines))
+    return [
+        (title, "\n".join(content).strip())
+        for title, content in sections
+        if title.strip()
+    ]
+
+
+def markdown_to_help_html(markdown_text: str) -> str:
+    def esc(value: str) -> str:
+        return escape(value)
+
+    html: list[str] = [
+        "<div style='font-family:Segoe UI,Arial,sans-serif; font-size:14px; line-height:1.5;'>"
+    ]
+    in_ul = False
+    in_ol = False
+    in_code = False
+    for raw in markdown_text.splitlines():
+        line = raw.rstrip("\n")
+        stripped = line.strip()
+
+        if stripped.startswith("```"):
+            if in_code:
+                html.append("</pre>")
+                in_code = False
+            else:
+                html.append(
+                    "<pre style='background:#0f1720;color:#e6f0ff;padding:10px;border-radius:8px;overflow:auto;'>"
+                )
+                in_code = True
+            continue
+
+        if in_code:
+            html.append(esc(line))
+            continue
+
+        if stripped.startswith("### "):
+            if in_ul:
+                html.append("</ul>")
+                in_ul = False
+            if in_ol:
+                html.append("</ol>")
+                in_ol = False
+            html.append(
+                f"<h3 style='margin:14px 0 6px 0;'>{esc(stripped[4:].strip())}</h3>"
+            )
+            continue
+
+        if stripped.startswith("- "):
+            if in_ol:
+                html.append("</ol>")
+                in_ol = False
+            if not in_ul:
+                html.append("<ul style='margin:6px 0 10px 18px;'>")
+                in_ul = True
+            html.append(f"<li>{esc(stripped[2:].strip())}</li>")
+            continue
+
+        first_dot = stripped.find(". ")
+        if first_dot > 0 and stripped[:first_dot].isdigit():
+            if in_ul:
+                html.append("</ul>")
+                in_ul = False
+            if not in_ol:
+                html.append("<ol style='margin:6px 0 10px 18px;'>")
+                in_ol = True
+            html.append(f"<li>{esc(stripped[first_dot + 2 :].strip())}</li>")
+            continue
+
+        if in_ul:
+            html.append("</ul>")
+            in_ul = False
+        if in_ol:
+            html.append("</ol>")
+            in_ol = False
+
+        if not stripped:
+            html.append("<div style='height:6px;'></div>")
+        else:
+            html.append(f"<p style='margin:4px 0;'>{esc(stripped)}</p>")
+
+    if in_ul:
+        html.append("</ul>")
+    if in_ol:
+        html.append("</ol>")
+    if in_code:
+        html.append("</pre>")
+    html.append("</div>")
+    return "\n".join(html)
+
+
+class HelpCenterDialog(QDialog):
+    def __init__(self, markdown_text: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        apply_dialog_theme(self)
+        self.setWindowTitle("Help Center")
+        self.setModal(True)
+        self.resize(980, 700)
+
+        self.sections = markdown_sections(markdown_text)
+        self.filtered_indices = list(range(len(self.sections)))
+
+        layout = QVBoxLayout(self)
+        top = QLabel(
+            "Open a topic and follow the steps from start to finish. Use search when you need one specific workflow."
+        )
+        top.setObjectName("sectionDescription")
+        layout.addWidget(top)
+
+        split = QSplitter(Qt.Orientation.Horizontal)
+        layout.addWidget(split, 1)
+
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Search help topics...")
+        self.search_input.textChanged.connect(self.filter_sections)
+        self.section_list = QListWidget()
+        self.section_list.currentRowChanged.connect(self.on_section_selected)
+        left_layout.addWidget(self.search_input)
+        left_layout.addWidget(self.section_list, 1)
+
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        self.section_title = QLabel("Choose a guide")
+        self.section_title.setObjectName("sectionTitle")
+        self.browser = QTextBrowser()
+        self.browser.setOpenExternalLinks(True)
+        right_layout.addWidget(self.section_title)
+        right_layout.addWidget(self.browser, 1)
+
+        split.addWidget(left)
+        split.addWidget(right)
+        split.setStretchFactor(0, 0)
+        split.setStretchFactor(1, 1)
+        split.setSizes([280, 680])
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=self)
+        buttons.rejected.connect(self.reject)
+        buttons.accepted.connect(self.accept)
+        buttons.button(QDialogButtonBox.StandardButton.Close).clicked.connect(
+            self.accept
+        )
+        layout.addWidget(buttons)
+
+        self.refresh_list()
+
+    def refresh_list(self) -> None:
+        self.section_list.blockSignals(True)
+        self.section_list.clear()
+        for index in self.filtered_indices:
+            title, _content = self.sections[index]
+            self.section_list.addItem(title)
+        self.section_list.blockSignals(False)
+        if self.section_list.count() > 0:
+            self.section_list.setCurrentRow(0)
+
+    def filter_sections(self, value: str) -> None:
+        query = value.strip().lower()
+        if not query:
+            self.filtered_indices = list(range(len(self.sections)))
+        else:
+            self.filtered_indices = [
+                idx
+                for idx, (title, content) in enumerate(self.sections)
+                if query in title.lower() or query in content.lower()
+            ]
+        self.refresh_list()
+
+    def on_section_selected(self, row: int) -> None:
+        if row < 0 or row >= len(self.filtered_indices):
+            self.section_title.setText("Choose a guide")
+            self.browser.setHtml("")
+            return
+        section_index = self.filtered_indices[row]
+        title, content = self.sections[section_index]
+        self.section_title.setText(title)
+        self.browser.setHtml(markdown_to_help_html(content))
+
+
 class VideoDropZone(QFrame):
     file_dropped = Signal(str)
 
@@ -3773,7 +5107,9 @@ class VideoDropZone(QFrame):
         layout.setSpacing(8)
         title = QLabel("Quick Play")
         title.setObjectName("sectionTitle")
-        body = QLabel("Drag and drop a video or picture here, then choose the screen or screens in the popup.")
+        body = QLabel(
+            "Drag and drop a video or picture here, then choose the screen or screens in the popup."
+        )
         body.setObjectName("sectionDescription")
         body.setWordWrap(True)
         layout.addWidget(title)
@@ -3781,7 +5117,11 @@ class VideoDropZone(QFrame):
 
     def dragEnterEvent(self, event) -> None:  # type: ignore[override]
         urls = event.mimeData().urls()
-        if urls and any(Path(url.toLocalFile()).suffix.lower() in SUPPORTED_MEDIA_EXTENSIONS for url in urls if url.isLocalFile()):
+        if urls and any(
+            Path(url.toLocalFile()).suffix.lower() in SUPPORTED_MEDIA_EXTENSIONS
+            for url in urls
+            if url.isLocalFile()
+        ):
             event.acceptProposedAction()
             return
         event.ignore()
@@ -3837,13 +5177,19 @@ class ScheduleSlotRow(QWidget):
         screen_label = QLabel()
         screen_label.setPixmap(screen_icon)
         screen_label.setToolTip(screens_tooltip)
-        icon_row.addWidget(screen_label, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        icon_row.addWidget(
+            screen_label, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
 
         if warning_icon is not None:
             warning_label = QLabel()
             warning_label.setPixmap(warning_icon)
             warning_label.setToolTip(warning_tooltip)
-            icon_row.addWidget(warning_label, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            icon_row.addWidget(
+                warning_label,
+                0,
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            )
 
         layout.addLayout(icon_row, 0)
 
@@ -3859,25 +5205,50 @@ class MainWindow(QMainWindow):
         self.backend_client = backend_client
         ensure_app_paths()
         config = load_config()
-        self.configured_screens = [ConfiguredScreen.from_dict(item.to_dict()) for item in config["configured_screens"]]
+        self.configured_screens = [
+            ConfiguredScreen.from_dict(item.to_dict())
+            for item in config["configured_screens"]
+        ]
         try:
             validate_unique_browser_bindings(self.configured_screens)
-            validate_unique_dlna_bindings(self.configured_screens)
-            validate_unique_miracast_bindings(self.configured_screens)
         except ValueError:
             self.configured_screens = []
-        self.screen_groups = [ScreenGroup.from_dict(item.to_dict()) for item in config["screen_groups"]]
+        self.screen_groups = [
+            ScreenGroup.from_dict(item.to_dict()) for item in config["screen_groups"]
+        ]
         self.schedules = [ScheduleEntry.from_dict(item) for item in config["schedules"]]
-        self.selected_monitor_ids = [str(item) for item in config["selected_monitor_ids"]]
-        self.video_directory: Path | None = Path(config["video_directory"]).expanduser() if config["video_directory"] else None
+        self.selected_monitor_ids = [
+            str(item) for item in config["selected_monitor_ids"]
+        ]
+        self.enabled_screen_ids = [
+            str(item) for item in config.get("enabled_screen_ids") or []
+        ]
+        self.video_directory: Path | None = (
+            Path(config["video_directory"]).expanduser()
+            if config["video_directory"]
+            else None
+        )
         if self.video_directory is not None and not self.video_directory.exists():
             self.video_directory = None
-        self.screen_aliases: dict[str, str] = {str(key): str(value) for key, value in config["screen_aliases"].items()}
-        self.screen_aliases.update(configured_screen_name_map(self.configured_screens))
+        self.screen_aliases: dict[str, str] = {
+            str(key): str(value) for key, value in config["screen_aliases"].items()
+        }
+        self.screen_registry = ScreenRegistry(self)
+        self.screen_aliases.update(self.screen_registry.configured_screen_name_map())
         self.transition_method = str(config["transition_method"])
         self.run_at_startup = bool(config["run_at_startup"])
+        self.lan_pairing_required = bool(config.get("lan_pairing_required"))
+        self.lan_allow_unpaired_clients = bool(config.get("lan_allow_unpaired_clients"))
+        self.lan_paired_client_ids = [
+            str(item).strip()
+            for item in (config.get("lan_paired_client_ids") or [])
+            if str(item).strip()
+        ]
         self.available_videos: list[Path] = []
-        self.current_selected_video_file = self.schedules[0].video_file if self.schedules else ""
+        self.current_selected_video_file = (
+            self.schedules[0].video_file if self.schedules else ""
+        )
+        self.current_media_assignments: dict[str, ScheduleMediaAssignment] = {}
         self.current_edit_id: str | None = None
         self._hero_progress = 0.0
         self._allow_real_quit = False
@@ -3887,17 +5258,20 @@ class MainWindow(QMainWindow):
         self._last_layout_width = 0
         self.current_active_screen_count = 0
         self.remote_screens: dict[str, dict[str, Any]] = {}
-        self.dlna_devices: dict[str, dict[str, Any]] = {}
-        self.miracast_devices: dict[str, dict[str, Any]] = {}
         self.backend_network_snapshot: dict[str, Any] = {}
         self.backend_online = False
         self.backend_state_version = 0
+        self.backend_channel_versions: dict[str, int] = {
+            name: 0 for name in STATE_CHANNELS
+        }
         self.backend_listener = BackendStateListener(self.backend_client, self)
         self.backend_paused = False
         self.backend_playback_enabled = False
         self.backend_window_count = 0
         self.backend_library_scanning = False
         self.backend_library_error = ""
+        self.backend_performance_metrics: dict[str, Any] = {}
+        self._pending_transition_method: str | None = None
 
         self.folder_watcher = QFileSystemWatcher(self)
         self.folder_refresh_timer = QTimer(self)
@@ -3909,6 +5283,7 @@ class MainWindow(QMainWindow):
         self.ui_status_timer = QTimer(self)
         self.ui_status_timer.setInterval(1000)
         self.ui_status_timer.timeout.connect(self.refresh_live_ui_status)
+        self._low_value_timers_paused = False
 
         self.setWindowTitle("Background Screen Controller")
         self.resize(1180, 760)
@@ -3916,7 +5291,9 @@ class MainWindow(QMainWindow):
         self.build_ui()
         self.setup_tray()
         self.backend_listener.snapshot_received.connect(self.apply_backend_snapshot)
-        self.backend_listener.connection_changed.connect(self.on_backend_connection_changed)
+        self.backend_listener.connection_changed.connect(
+            self.on_backend_connection_changed
+        )
         self.setup_screen_watchers()
         self.refresh_monitors()
         self.refresh_schedule_list()
@@ -3961,6 +5338,15 @@ class MainWindow(QMainWindow):
             }
             QMenu::item:selected {
                 background: rgba(93,183,240,0.16);
+                color: #112c40;
+            }
+            QMenu::item:disabled {
+                color: rgba(23,48,67,0.48);
+            }
+            QMenu::separator {
+                height: 1px;
+                background: rgba(23,48,67,0.12);
+                margin: 6px 10px;
             }
             QFrame#heroSurface,
             QFrame#surface,
@@ -4142,13 +5528,12 @@ class MainWindow(QMainWindow):
             QCheckBox {
                 color: #173043;
                 spacing: 8px;
-                font-weight: 600;
             }
             QCheckBox::indicator {
-                width: 18px;
-                height: 18px;
-                border-radius: 6px;
-                border: 1px solid rgba(23,48,67,0.22);
+                width: 17px;
+                height: 17px;
+                border-radius: 5px;
+                border: 1px solid rgba(23,48,67,0.45);
                 background: #ffffff;
             }
             QCheckBox::indicator:checked {
@@ -4221,39 +5606,76 @@ class MainWindow(QMainWindow):
         self.start_engine_action = QAction("Start Engine", self)
         self.start_engine_action.triggered.connect(self.start_backend_engine)
         engine_menu.addAction(self.start_engine_action)
-        self.manage_screens_action = QAction("Configured Screens...", self)
-        self.manage_screens_action.triggered.connect(self.manage_configured_screens)
-        engine_menu.addAction(self.manage_screens_action)
+
         self.stop_engine_action = QAction("Stop Engine", self)
         self.stop_engine_action.triggered.connect(self.stop_backend_engine)
         engine_menu.addAction(self.stop_engine_action)
         self.retry_firewall_action = QAction("Retry LAN Firewall Setup", self)
         self.retry_firewall_action.triggered.connect(self.retry_lan_firewall_setup)
         engine_menu.addAction(self.retry_firewall_action)
-        self.refresh_dlna_action = QAction("Refresh DLNA Discovery", self)
-        self.refresh_dlna_action.triggered.connect(self.refresh_dlna_discovery)
-        engine_menu.addAction(self.refresh_dlna_action)
-        self.refresh_miracast_action = QAction("Refresh Miracast Discovery", self)
-        self.refresh_miracast_action.triggered.connect(self.refresh_miracast_discovery)
-        engine_menu.addAction(self.refresh_miracast_action)
-        self.open_windows_display_settings_action = QAction("Open Windows Display Settings", self)
-        self.open_windows_display_settings_action.triggered.connect(self.open_windows_display_settings)
+        self.open_windows_display_settings_action = QAction(
+            "Open Windows Display Settings", self
+        )
+        self.open_windows_display_settings_action.triggered.connect(
+            self.open_windows_display_settings
+        )
         engine_menu.addAction(self.open_windows_display_settings_action)
         self.refresh_engine_action = QAction("Refresh Engine Status", self)
-        self.refresh_engine_action.triggered.connect(lambda: self.pull_backend_state(initial=False))
+        self.refresh_engine_action.triggered.connect(
+            lambda: self.pull_backend_state(initial=False)
+        )
         engine_menu.addAction(self.refresh_engine_action)
+        self.export_diagnostics_action = QAction("Export Diagnostics...", self)
+        self.export_diagnostics_action.triggered.connect(self.export_engine_diagnostics)
+        engine_menu.addAction(self.export_diagnostics_action)
         screen_menu = self.menuBar().addMenu("Screen")
-        self.screen_target_menu = screen_menu.addMenu("Default Group Screens")
+        self.screen_target_menu = QMenu("Default Group Screens", self)
+        self.rename_screens_menu = QMenu("Name Screens", self)
+        self.remote_screens_menu = QMenu("Remote LAN Screens", self)
         self.manage_groups_action = QAction("Manage Screen Groups...", self)
         self.manage_groups_action.triggered.connect(self.manage_screen_groups)
-        screen_menu.addAction(self.manage_groups_action)
-        self.rename_screens_menu = screen_menu.addMenu("Name Screens")
-        self.remote_screens_menu = screen_menu.addMenu("Remote LAN Screens")
-        self.dlna_screens_menu = screen_menu.addMenu("Discovered DLNA Devices")
-        self.miracast_screens_menu = screen_menu.addMenu("Discovered Miracast Devices")
+        self.purge_offline_screens_action = QAction(
+            "Purge Offline Remembered Screens", self
+        )
+        self.purge_offline_screens_action.triggered.connect(self.purge_offline_screens)
+        self.purge_all_screens_action = QAction("Purge All Remembered Screens", self)
+        self.purge_all_screens_action.triggered.connect(self.purge_all_screens)
+
+        self.open_manage_screens_action = QAction("Manage Screens", self)
+        self.open_manage_screens_action.triggered.connect(
+            self.open_manage_screens_popup
+        )
+        screen_menu.addAction(self.open_manage_screens_action)
+        self.merge_duplicate_screens_action = QAction(
+            "Merge Duplicate Remembered Screens...", self
+        )
+        self.merge_duplicate_screens_action.triggered.connect(
+            self.merge_duplicate_screens
+        )
+        screen_menu.addAction(self.merge_duplicate_screens_action)
+        self.manage_screens_action = QAction("Configured Screens...", self)
+        self.manage_screens_action.triggered.connect(self.manage_configured_screens)
+        screen_menu.addAction(self.manage_screens_action)
         refresh_screens_action = QAction("Refresh Screens", self)
         refresh_screens_action.triggered.connect(self.refresh_monitors)
         screen_menu.addAction(refresh_screens_action)
+
+        help_menu = self.menuBar().addMenu("Help")
+        self.open_help_docs_action = QAction("Setup & User Guide", self)
+        self.open_help_docs_action.triggered.connect(self.open_help_documentation)
+        help_menu.addAction(self.open_help_docs_action)
+        self.open_release_checklist_action = QAction("Release Checklist", self)
+        self.open_release_checklist_action.triggered.connect(
+            self.open_release_checklist
+        )
+        help_menu.addAction(self.open_release_checklist_action)
+        self.open_accessibility_review_action = QAction(
+            "Accessibility & Contrast Review", self
+        )
+        self.open_accessibility_review_action.triggered.connect(
+            self.open_accessibility_review
+        )
+        help_menu.addAction(self.open_accessibility_review_action)
         library_menu = self.menuBar().addMenu("Library")
         set_folder_action = QAction("Set Media Folder", self)
         set_folder_action.triggered.connect(self.choose_video_folder)
@@ -4274,7 +5696,9 @@ class MainWindow(QMainWindow):
         eyebrow.setObjectName("eyebrow")
         self.hero_title_label = ElidedLabel("No active slot")
         self.hero_title_label.setObjectName("heroTitle")
-        self.hero_subtitle_label = ElidedLabel("Waiting for a matching UK-time schedule.")
+        self.hero_subtitle_label = ElidedLabel(
+            "Waiting for a matching UK-time schedule."
+        )
         self.hero_subtitle_label.setObjectName("heroSubtitle")
         self.hero_progress_track = QFrame()
         self.hero_progress_track.setObjectName("progressTrack")
@@ -4332,7 +5756,9 @@ class MainWindow(QMainWindow):
         remote_title.setObjectName("sectionTitle")
         self.remote_screen_summary_label = ElidedLabel("0 connected")
         self.remote_screen_summary_label.setObjectName("videoCardTitle")
-        self.remote_screen_detail_label = ElidedLabel("Open the TV URL on Whale OS screens to register them.")
+        self.remote_screen_detail_label = ElidedLabel(
+            "Open the TV URL on Whale OS screens to register them."
+        )
         self.remote_screen_detail_label.setObjectName("mutedText")
         remote_meta.addWidget(remote_title)
         remote_meta.addWidget(self.remote_screen_summary_label)
@@ -4397,7 +5823,9 @@ class MainWindow(QMainWindow):
         list_buttons = QHBoxLayout()
         self.new_schedule_button = QPushButton("New")
         self.new_schedule_button.setProperty("variant", "primary")
-        self.new_schedule_button.clicked.connect(lambda: self.load_schedule_into_form(None))
+        self.new_schedule_button.clicked.connect(
+            lambda: self.load_schedule_into_form(None)
+        )
         self.delete_schedule_button = QPushButton("Delete")
         self.delete_schedule_button.setProperty("variant", "danger")
         self.delete_schedule_button.clicked.connect(self.delete_selected_schedule)
@@ -4413,7 +5841,9 @@ class MainWindow(QMainWindow):
 
         editor_title = QLabel("Schedule Details")
         editor_title.setObjectName("sectionTitle")
-        editor_copy = QLabel("Schedules now point to video or image files inside the chosen library folder.")
+        editor_copy = QLabel(
+            "Schedules now point to video or image files inside the chosen library folder."
+        )
         editor_copy.setObjectName("sectionDescription")
         editor_copy.setWordWrap(True)
         form_layout.addWidget(editor_title)
@@ -4445,7 +5875,9 @@ class MainWindow(QMainWindow):
         self.current_form_screen_ids: list[str] = [DEFAULT_GROUP_ID]
         self.schedule_screen_button = QToolButton()
         self.schedule_screen_button.setText("Target Screens")
-        self.schedule_screen_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.schedule_screen_button.setPopupMode(
+            QToolButton.ToolButtonPopupMode.InstantPopup
+        )
         self.schedule_screen_menu = QMenu(self)
         self.schedule_screen_button.setMenu(self.schedule_screen_menu)
         self.schedule_screen_summary_label = ElidedLabel(DEFAULT_GROUP_NAME)
@@ -4485,22 +5917,43 @@ class MainWindow(QMainWindow):
         self.choose_media_button = QPushButton("Choose Media")
         self.choose_media_button.setProperty("variant", "ghost")
         self.choose_media_button.clicked.connect(self.open_media_picker)
+        self.per_screen_media_button = QPushButton("Per-Screen Media")
+        self.per_screen_media_button.setProperty("variant", "ghost")
+        self.per_screen_media_button.clicked.connect(self.edit_per_screen_media)
         self.transition_selector = QComboBox()
         for key, label in TRANSITION_METHODS.items():
             self.transition_selector.addItem(label, key)
+        transition_caption = QLabel("Transition")
+        transition_caption.setObjectName("mutedText")
         transition_index = self.transition_selector.findData(self.transition_method)
-        self.transition_selector.setCurrentIndex(transition_index if transition_index >= 0 else 0)
+        self.transition_selector.setCurrentIndex(
+            transition_index if transition_index >= 0 else 0
+        )
         self.transition_selector.currentIndexChanged.connect(self.on_transition_changed)
         self.transition_selector.setMaximumWidth(190)
         action_layout.addWidget(self.schedule_screen_button)
         action_layout.addWidget(self.choose_media_button)
+        action_layout.addWidget(self.per_screen_media_button)
+        action_layout.addWidget(transition_caption)
         action_layout.addWidget(self.transition_selector)
         action_layout.addStretch(1)
+
+        action_field_with_hint = QWidget()
+        action_field_with_hint_layout = QVBoxLayout(action_field_with_hint)
+        action_field_with_hint_layout.setContentsMargins(0, 0, 0, 0)
+        action_field_with_hint_layout.setSpacing(4)
+        action_field_with_hint_layout.addWidget(action_field)
+        self.transition_scope_hint = QLabel(
+            "Transition applies globally to playback outputs (not per-schedule slot)."
+        )
+        self.transition_scope_hint.setObjectName("mutedText")
+        self.transition_scope_hint.setWordWrap(True)
+        action_field_with_hint_layout.addWidget(self.transition_scope_hint)
 
         form_grid.addRow("Title", self.title_input)
         form_grid.addRow("Time", time_field)
         form_grid.addRow("Days", days_field)
-        form_grid.addRow("Actions", action_field)
+        form_grid.addRow("Actions", action_field_with_hint)
         for row in range(form_grid.rowCount()):
             item = form_grid.itemAt(row, QFormLayout.ItemRole.LabelRole)
             if item and item.widget():
@@ -4545,9 +5998,19 @@ class MainWindow(QMainWindow):
         time_group.setSpacing(1)
         time_group.addWidget(self.footer_time_primary)
         time_group.addWidget(self.footer_time_secondary)
-        footer_total_icon = self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon).pixmap(16, 16)
-        footer_global_icon = self.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton).pixmap(16, 16)
-        footer_active_icon = self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay).pixmap(16, 16)
+        footer_total_icon = (
+            self.style()
+            .standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+            .pixmap(16, 16)
+        )
+        footer_global_icon = (
+            self.style()
+            .standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton)
+            .pixmap(16, 16)
+        )
+        footer_active_icon = (
+            self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay).pixmap(16, 16)
+        )
         self.footer_total_icon = QLabel()
         self.footer_total_icon.setPixmap(footer_total_icon)
         self.footer_total_primary = QLabel("0 available")
@@ -4592,6 +6055,28 @@ class MainWindow(QMainWindow):
         active_group.setSpacing(8)
         active_group.addWidget(self.footer_active_icon, 0, Qt.AlignmentFlag.AlignTop)
         active_group.addLayout(active_text)
+
+        footer_diagnostics_icon = (
+            self.style()
+            .standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView)
+            .pixmap(16, 16)
+        )
+        self.footer_diagnostics_icon = QLabel()
+        self.footer_diagnostics_icon.setPixmap(footer_diagnostics_icon)
+        self.footer_diagnostics_primary = QLabel("0 workers")
+        self.footer_diagnostics_primary.setObjectName("footerPrimary")
+        self.footer_diagnostics_secondary = QLabel("Engine diagnostics unavailable")
+        self.footer_diagnostics_secondary.setObjectName("footerSecondary")
+        diagnostics_text = QVBoxLayout()
+        diagnostics_text.setSpacing(1)
+        diagnostics_text.addWidget(self.footer_diagnostics_primary)
+        diagnostics_text.addWidget(self.footer_diagnostics_secondary)
+        diagnostics_group = QHBoxLayout()
+        diagnostics_group.setSpacing(8)
+        diagnostics_group.addWidget(
+            self.footer_diagnostics_icon, 0, Qt.AlignmentFlag.AlignTop
+        )
+        diagnostics_group.addLayout(diagnostics_text)
         footer_layout.addLayout(time_group)
         footer_layout.addStretch(1)
         footer_layout.addLayout(total_group)
@@ -4599,6 +6084,8 @@ class MainWindow(QMainWindow):
         footer_layout.addLayout(global_group)
         footer_layout.addSpacing(18)
         footer_layout.addLayout(active_group)
+        footer_layout.addSpacing(18)
+        footer_layout.addLayout(diagnostics_group)
         outer.addWidget(footer)
         self.refresh_responsive_layout()
 
@@ -4623,29 +6110,29 @@ class MainWindow(QMainWindow):
         return panel
 
     def setup_tray(self) -> None:
-        if not QSystemTrayIcon.isSystemTrayAvailable():
-            self.tray_icon = None
+        # Controller tray icon intentionally disabled. Engine tray icon is the single source.
+        self.tray_icon = None
+
+    def _set_low_value_timers_paused(self, paused: bool) -> None:
+        desired = bool(paused)
+        if bool(getattr(self, "_low_value_timers_paused", False)) == desired:
             return
-        self.tray_icon = QSystemTrayIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon), self)
-        tray_menu = QMenu(self)
-        show_action = tray_menu.addAction("Show Controller")
-        show_action.triggered.connect(self.show_from_tray)
-        background_action = tray_menu.addAction("Run in Background")
-        background_action.triggered.connect(self.send_to_background)
-        pause_action = tray_menu.addAction("Pause / Play")
-        pause_action.triggered.connect(self.handle_toggle_pause)
-        stop_action = tray_menu.addAction("Stop Screens")
-        stop_action.triggered.connect(self.handle_stop_screens)
-        tray_menu.addSeparator()
-        quit_action = tray_menu.addAction("Quit Completely")
-        quit_action.triggered.connect(self.quit_from_tray)
-        self.tray_icon.setContextMenu(tray_menu)
-        self.tray_icon.activated.connect(lambda reason: self.show_from_tray() if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
-        self.tray_icon.show()
+        self._low_value_timers_paused = desired
+        if desired:
+            if hasattr(self, "ui_status_timer"):
+                self.ui_status_timer.stop()
+            if hasattr(self, "screen_refresh_timer"):
+                self.screen_refresh_timer.stop()
+            if hasattr(self, "folder_refresh_timer"):
+                self.folder_refresh_timer.stop()
+            return
+        if hasattr(self, "ui_status_timer") and not self._shutdown_in_progress:
+            self.ui_status_timer.start()
 
     def send_to_background(self) -> None:
         if self._allow_real_quit:
             return
+        self._set_low_value_timers_paused(True)
         if self.tray_icon is None or not self.tray_icon.isVisible():
             self.showMinimized()
             return
@@ -4658,6 +6145,7 @@ class MainWindow(QMainWindow):
         )
 
     def show_from_tray(self) -> None:
+        self._set_low_value_timers_paused(False)
         self.showNormal()
         if self.fullscreen_action.isChecked():
             self.showFullScreen()
@@ -4671,7 +6159,13 @@ class MainWindow(QMainWindow):
             self.showMaximized()
         self.schedule_layout_refresh()
 
-    def call_backend_action(self, action: str, payload: dict[str, Any] | None = None, *, show_errors: bool = True) -> dict[str, Any] | None:
+    def call_backend_action(
+        self,
+        action: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        show_errors: bool = True,
+    ) -> dict[str, Any] | None:
         try:
             response = self.backend_client.action(action, payload or {})
         except Exception as error:  # noqa: BLE001
@@ -4682,7 +6176,9 @@ class MainWindow(QMainWindow):
         if isinstance(snapshot, dict):
             self.apply_backend_snapshot(snapshot)
         if not response.get("ok", True) and show_errors:
-            self.set_form_message(str(response.get("error") or "Action failed."), "error")
+            self.set_form_message(
+                str(response.get("error") or "Action failed."), "error"
+            )
             return None
         return response
 
@@ -4695,6 +6191,8 @@ class MainWindow(QMainWindow):
         if hasattr(self, "retry_firewall_action"):
             self.retry_firewall_action.setEnabled(self.backend_online)
         self.refresh_engine_action.setEnabled(True)
+        if hasattr(self, "export_diagnostics_action"):
+            self.export_diagnostics_action.setEnabled(self.backend_online)
 
     def set_backend_offline_ui(self, detail: str = "") -> None:
         self.backend_online = False
@@ -4705,13 +6203,22 @@ class MainWindow(QMainWindow):
         self.refresh_monitors()
         self.network_status_primary.setText("Background engine offline")
         self.network_status_secondary.setText(
-            detail or "Local screens can still be detected, but playback control is unavailable until the engine responds."
+            detail
+            or "Local screens can still be detected, but playback control is unavailable until the engine responds."
         )
-        self.network_url_label.setText("Use Engine > Start Engine to bring the background engine online.")
+        self.network_url_label.setText(
+            "Use Engine > Start Engine to bring the background engine online."
+        )
         self.network_url_label.setToolTip(self.network_url_label.text())
         self.remote_screen_summary_label.setText("Engine offline")
-        self.remote_screen_detail_label.setText("Connected-device details appear here while the engine is running.")
-        self.remote_screen_detail_label.setToolTip(self.remote_screen_detail_label.text())
+        self.remote_screen_detail_label.setText(
+            "Connected-device details appear here while the engine is running."
+        )
+        self.remote_screen_detail_label.setToolTip(
+            self.remote_screen_detail_label.text()
+        )
+        self.backend_performance_metrics = {}
+        self.update_engine_diagnostics_summary()
         self.update_engine_menu_state()
 
     def pull_backend_state(self, initial: bool = False) -> None:
@@ -4728,14 +6235,33 @@ class MainWindow(QMainWindow):
         self.apply_backend_snapshot(snapshot)
         self.update_engine_menu_state()
 
+    def _flush_pending_transition_method(self) -> None:
+        pending = str(self._pending_transition_method or "").strip()
+        if not pending:
+            return
+        if pending not in TRANSITION_METHODS:
+            self._pending_transition_method = None
+            return
+        if not self.backend_online:
+            return
+        response = self.call_backend_action(
+            "set_transition_method",
+            {"transition_method": pending},
+            show_errors=False,
+        )
+        if response is not None and response.get("ok", True):
+            self._pending_transition_method = None
+
     def on_backend_connection_changed(self, online: bool, detail: str = "") -> None:
         if online:
             if not self.backend_online:
                 self.pull_backend_state(initial=False)
+            self._flush_pending_transition_method()
             return
         if self.backend_online:
             self.set_backend_offline_ui(
-                detail or "Local screens can still be detected, but playback control is unavailable until the engine responds."
+                detail
+                or "Local screens can still be detected, but playback control is unavailable until the engine responds."
             )
 
     def refresh_live_ui_status(self) -> None:
@@ -4745,24 +6271,35 @@ class MainWindow(QMainWindow):
         if not self.backend_playback_enabled:
             active_label = "Playback stopped"
         else:
-            active_entry = active_schedule_for_minute(self.schedules, weekday_index, minute_of_day)
-            active_label = "No active schedule" if active_entry is None else f"{active_entry.title} • {active_entry.range_label} • {active_entry.video_label or active_entry.video_file}"
+            active_entry = active_schedule_for_minute(
+                self.schedules, weekday_index, minute_of_day
+            )
+            active_label = (
+                "No active schedule"
+                if active_entry is None
+                else f"{active_entry.title} • {active_entry.range_label} • {active_entry.video_label or active_entry.video_file}"
+            )
         self.update_status_labels(clock_label, active_label)
 
     def start_backend_engine(self, checked: bool = False) -> None:
         if self.backend_online and self.backend_client.ping():
-            self.set_form_message("The background engine is already running.", "success")
+            self.set_form_message(
+                "The background engine is already running.", "success"
+            )
             self.update_engine_menu_state()
             return
         try:
             ensure_backend_running(self.backend_client)
         except Exception as error:  # noqa: BLE001
-            message = str(error) or "The controller could not start the background engine."
+            message = (
+                str(error) or "The controller could not start the background engine."
+            )
             self.set_backend_offline_ui(message)
             self.set_form_message(message, "error")
             return
         self.pull_backend_state(initial=True)
         self.backend_listener.start()
+        self._flush_pending_transition_method()
         self.set_form_message("Background engine started.", "success")
 
     def stop_backend_engine(self, checked: bool = False) -> None:
@@ -4779,10 +6316,14 @@ class MainWindow(QMainWindow):
             self.set_backend_offline_ui()
             self.set_form_message("Background engine stopped.", "success")
         else:
-            self.set_form_message("Background engine was not running or could not be stopped.", "error")
+            self.set_form_message(
+                "Background engine was not running or could not be stopped.", "error"
+            )
 
     def manage_configured_screens(self, checked: bool = False) -> None:
-        dialog = ConfiguredScreenManagerDialog(self.configured_screens, self.remote_screens, self.dlna_devices, self.miracast_devices, self)
+        dialog = ConfiguredScreenManagerDialog(
+            self.configured_screens, self.remote_screens, self
+        )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         updated_screens = dialog.configured_screens()
@@ -4791,13 +6332,22 @@ class MainWindow(QMainWindow):
             {"configured_screens": [screen.to_dict() for screen in updated_screens]},
         )
         if response is not None:
-            self.set_form_message(f"Configured screens saved ({len(self.configured_screens)}).", "success")
+            self.set_form_message(
+                f"Configured screens saved ({len(self.configured_screens)}).", "success"
+            )
 
     def all_screen_groups(self) -> list[ScreenGroup]:
+        registry = getattr(self, "screen_registry", None)
+        if registry is not None:
+            return registry.all_screen_groups()
         return combined_screen_groups(self.selected_monitor_ids, self.screen_groups)
 
     def manage_screen_groups(self, checked: bool = False) -> None:
-        targets = [target for target in self.unified_screen_targets(include_offline=True) if not is_group_target_id(target.id)]
+        targets = [
+            target
+            for target in self.unified_screen_targets(include_offline=True)
+            if not is_group_target_id(target.id)
+        ]
         dialog = ScreenGroupManagerDialog(self.screen_groups, targets, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -4807,7 +6357,9 @@ class MainWindow(QMainWindow):
             {"screen_groups": [group.to_dict() for group in updated_groups]},
         )
         if response is not None:
-            self.set_form_message(f"Screen groups saved ({len(self.screen_groups)}).", "success")
+            self.set_form_message(
+                f"Screen groups saved ({len(self.screen_groups)}).", "success"
+            )
 
     def retry_lan_firewall_setup(self, checked: bool = False) -> None:
         response = self.call_backend_action("retry_firewall_setup")
@@ -4823,25 +6375,40 @@ class MainWindow(QMainWindow):
         if firewall_warnings:
             self.set_form_message(firewall_warnings[0], "error")
         else:
-            self.set_form_message("LAN firewall check completed. Review the LAN panel warnings if screens still cannot connect.", "success")
+            self.set_form_message(
+                "LAN firewall check completed. Review the LAN panel warnings if screens still cannot connect.",
+                "success",
+            )
 
-    def refresh_dlna_discovery(self, checked: bool = False) -> None:
-        response = self.call_backend_action("refresh_dlna_discovery")
-        if response is not None:
-            self.set_form_message(f"DLNA discovery refreshed ({len(self.dlna_devices)} device(s) found).", "success")
-
-    def refresh_miracast_discovery(self, checked: bool = False) -> None:
-        response = self.call_backend_action("refresh_miracast_discovery")
-        if response is not None:
-            self.set_form_message(f"Miracast discovery refreshed ({len(self.miracast_devices)} device(s) found).", "success")
+    def export_engine_diagnostics(self, checked: bool = False) -> None:
+        default_name = f"background_screen_diagnostics_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+        suggested_path = str((Path.home() / "Downloads" / default_name).expanduser())
+        target_path, _filter = QFileDialog.getSaveFileName(
+            self,
+            "Export Engine Diagnostics",
+            suggested_path,
+            "Zip Archives (*.zip)",
+        )
+        if not target_path:
+            return
+        response = self.call_backend_action(
+            "export_diagnostics",
+            {"path": str(target_path)},
+        )
+        if response is None:
+            return
+        export_path = str(response.get("exportPath") or target_path)
+        self.set_form_message(f"Diagnostics exported to {export_path}", "success")
 
     def open_windows_display_settings(self, checked: bool = False) -> None:
         try:
             if sys.platform == "win32":
                 os.startfile("ms-settings:display")
-                self.set_form_message("Opened Windows display settings. Use 'Connect to a wireless display' there.", "success")
+                self.set_form_message("Opened Windows display settings.", "success")
         except OSError as error:
-            self.set_form_message(f"Could not open Windows display settings: {error}", "error")
+            self.set_form_message(
+                f"Could not open Windows display settings: {error}", "error"
+            )
 
     def handle_toggle_pause(self, checked: bool = False) -> None:
         self.call_backend_action("toggle_pause")
@@ -4884,7 +6451,9 @@ class MainWindow(QMainWindow):
             self.tray_icon = None
 
     def toggle_run_at_startup(self, checked: bool = False) -> None:
-        response = self.call_backend_action("set_run_at_startup", {"value": self.run_at_startup_action.isChecked()})
+        response = self.call_backend_action(
+            "set_run_at_startup", {"value": self.run_at_startup_action.isChecked()}
+        )
         if response is None:
             self.run_at_startup_action.blockSignals(True)
             self.run_at_startup_action.setChecked(self.run_at_startup)
@@ -4898,9 +6467,37 @@ class MainWindow(QMainWindow):
         app.screenRemoved.connect(self.on_screen_topology_changed)
 
     def on_screen_topology_changed(self, *_args) -> None:
+        if self._low_value_timers_paused:
+            return
         self.screen_refresh_timer.start()
 
-    def unified_screen_targets(self, include_offline: bool = True) -> list[UnifiedScreenTarget]:
+    def browser_configured_screen_ids(self) -> set[str]:
+        registry = getattr(self, "screen_registry", None)
+        if registry is not None:
+            return registry.browser_configured_screen_ids()
+        return configured_browser_screen_ids(self.configured_screens)
+
+    def static_media_configured_screen_ids(self) -> set[str]:
+        registry = getattr(self, "screen_registry", None)
+        if registry is not None:
+            return registry.static_media_configured_screen_ids()
+        return {
+            screen.id
+            for screen in self.configured_screens
+            if "static_media" in screen.capabilities
+        }
+
+    def unified_screen_targets(
+        self, include_offline: bool = True
+    ) -> list[UnifiedScreenTarget]:
+        registry = getattr(self, "screen_registry", None)
+        if registry is not None:
+            return registry.unified_screen_targets(
+                local_screens=available_screens(),
+                screen_identifier=screen_identifier,
+                screen_display_name=screen_display_name,
+                include_offline=include_offline,
+            )
         targets: list[UnifiedScreenTarget] = []
         static_media_ids = self.static_media_configured_screen_ids()
         for screen in available_screens():
@@ -4915,26 +6512,15 @@ class MainWindow(QMainWindow):
                     detail=f"HDMI / local display • {geometry.width()}x{geometry.height()}",
                 )
             )
-        for screen in sorted((item for item in self.configured_screens if item.transport == "browser"), key=lambda item: item.name.lower()):
+        for screen in sorted(
+            (item for item in self.configured_screens if item.transport == "browser"),
+            key=lambda item: item.name.lower(),
+        ):
             if screen.id not in static_media_ids:
                 continue
-            online, detail, warning = browser_target_status_detail(screen, self.remote_screens)
-            if not include_offline and not online:
-                continue
-            targets.append(
-                UnifiedScreenTarget(
-                    id=screen.id,
-                    label=screen.name,
-                    kind="remote",
-                    online=online,
-                    detail=detail,
-                    warning=warning,
-                )
+            online, detail, warning = browser_target_status_detail(
+                screen, self.remote_screens
             )
-        for screen in sorted((item for item in self.configured_screens if item.transport == "dlna"), key=lambda item: item.name.lower()):
-            if screen.id not in static_media_ids:
-                continue
-            online, detail, warning = dlna_target_status_detail(screen, self.dlna_devices)
             if not include_offline and not online:
                 continue
             targets.append(
@@ -4956,19 +6542,30 @@ class MainWindow(QMainWindow):
         mdns_url = snapshot.get("mdns_url") or ""
         warnings = snapshot.get("warnings") or []
         firewall_configured = bool(snapshot.get("firewallConfigured"))
+        pairing_required = bool(snapshot.get("pairingRequired"))
+        pending_clients = snapshot.get("pendingClients") or []
+        pending_count = int(
+            snapshot.get("pendingClientCount") or len(pending_clients) or 0
+        )
         preferred_interface = snapshot.get("preferred_interface") or ""
         interface_lines = [
             f"{item.get('label') or 'Network Interface'}: {item.get('ip') or ''}"
             for item in snapshot.get("interfaces") or []
             if item.get("ip")
         ]
-        connected = sum(1 for item in self.remote_screens.values() if item.get("online"))
+        connected = sum(
+            1 for item in self.remote_screens.values() if item.get("online")
+        )
         total = len(self.remote_screens)
         if self.backend_online and preferred:
             self.network_status_primary.setText("Background engine online")
             self.network_status_secondary.setText(
                 f"TV URL ready on port {snapshot.get('port')} • IP: {snapshot.get('preferred_ip') or 'Unavailable'}"
-                + (f" • Interface: {preferred_interface}" if preferred_interface else "")
+                + (
+                    f" • Interface: {preferred_interface}"
+                    if preferred_interface
+                    else ""
+                )
                 + f" • Hostname: {snapshot.get('hostname') or 'Unavailable'}"
             )
             extra_urls = []
@@ -4990,11 +6587,17 @@ class MainWindow(QMainWindow):
             if fallback_urls:
                 self.network_url_label.setText("Try: " + " • ".join(fallback_urls))
             else:
-                self.network_url_label.setText("Connect this PC to the same LAN as the TVs and allow local firewall access.")
+                self.network_url_label.setText(
+                    "Connect this PC to the same LAN as the TVs and allow local firewall access."
+                )
         else:
             self.network_status_primary.setText("Background engine offline")
-            self.network_status_secondary.setText("Start the engine to enable LAN screen connections.")
-            self.network_url_label.setText("Use Engine > Start Engine to bring the background engine online.")
+            self.network_status_secondary.setText(
+                "Start the engine to enable LAN screen connections."
+            )
+            self.network_url_label.setText(
+                "Use Engine > Start Engine to bring the background engine online."
+            )
         if warnings:
             tip_lines = [str(item) for item in warnings]
             if interface_lines:
@@ -5008,7 +6611,10 @@ class MainWindow(QMainWindow):
                 tip_lines.extend(interface_lines)
             self.network_url_label.setToolTip("\n".join(tip_lines))
         if self.backend_online:
-            self.remote_screen_summary_label.setText(f"{connected} connected • {total} known")
+            summary = f"{connected} connected • {total} known"
+            if pairing_required:
+                summary += f" • {pending_count} pending"
+            self.remote_screen_summary_label.setText(summary)
         else:
             self.remote_screen_summary_label.setText("Engine offline")
         if self.backend_online and total:
@@ -5016,28 +6622,96 @@ class MainWindow(QMainWindow):
                 f"{friendly_remote_name(screen_id, self.screen_aliases, state)} ({'online' if state.get('online') else 'offline'})"
                 for screen_id, state in self.remote_screens.items()
             ]
-            self.remote_screen_detail_label.setText("Registered LAN TVs are available alongside local HDMI screens.")
-            self.remote_screen_detail_label.setToolTip("\n".join(names))
+            pending_lines = [
+                f"{str(item.get('name') or item.get('client_id') or 'Unknown')} ({str(item.get('ip') or 'unknown ip')})"
+                for item in pending_clients
+                if isinstance(item, dict)
+            ]
+            if pairing_required and pending_count > 0:
+                self.remote_screen_detail_label.setText(
+                    "Registered LAN TVs are available. Pairing is enabled; pending clients need approval."
+                )
+            elif pairing_required:
+                self.remote_screen_detail_label.setText(
+                    "Registered LAN TVs are available. Pairing is enabled."
+                )
+            else:
+                self.remote_screen_detail_label.setText(
+                    "Registered LAN TVs are available alongside local HDMI screens."
+                )
+            tooltip_lines = names[:]
+            if pending_lines:
+                tooltip_lines.extend(["", "Pending unpaired clients:"])
+                tooltip_lines.extend(pending_lines)
+            self.remote_screen_detail_label.setToolTip("\n".join(tooltip_lines))
         elif self.backend_online:
-            self.remote_screen_detail_label.setText("Open the TV URL on Whale OS screens to register them.")
-            self.remote_screen_detail_label.setToolTip(self.network_url_label.text())
+            if pairing_required and pending_count > 0:
+                self.remote_screen_detail_label.setText(
+                    "Pairing is enabled. Pending LAN clients are waiting for approval."
+                )
+                pending_lines = [
+                    f"{str(item.get('name') or item.get('client_id') or 'Unknown')} ({str(item.get('ip') or 'unknown ip')})"
+                    for item in pending_clients
+                    if isinstance(item, dict)
+                ]
+                self.remote_screen_detail_label.setToolTip("\n".join(pending_lines))
+            else:
+                self.remote_screen_detail_label.setText(
+                    "Open the TV URL on Whale OS screens to register them."
+                )
+                self.remote_screen_detail_label.setToolTip(
+                    self.network_url_label.text()
+                )
 
     def refresh_monitors(self, *_args) -> None:
         self.screen_target_menu.clear()
         self.rename_screens_menu.clear()
         self.remote_screens_menu.clear()
-        self.dlna_screens_menu.clear()
-        self.miracast_screens_menu.clear()
         self.schedule_screen_menu.clear()
-        configured_transport_by_id = {screen.id: screen.transport for screen in self.configured_screens}
+        configured_transport_by_id = {
+            screen.id: screen.transport for screen in self.configured_screens
+        }
+        in_use_target_ids = (
+            set(self.selected_monitor_ids)
+            | set(self.current_form_screen_ids)
+            | set(self.enabled_screen_ids)
+        )
+        for entry in self.schedules:
+            in_use_target_ids.update(entry.screen_ids)
+
+        raw_targets = self.unified_screen_targets(include_offline=True)
+        visible_targets = [
+            target
+            for target in raw_targets
+            if target.online or target.id in in_use_target_ids
+        ]
+        visible_targets.sort(
+            key=lambda item: (0 if item.online else 1, item.label.lower())
+        )
+
         for group in self.all_screen_groups():
-            group_action = self.schedule_screen_menu.addAction(f"{group.name} ({len(group.screen_ids)})")
+            group_action = self.schedule_screen_menu.addAction(
+                f"{group.name} ({len(group.screen_ids)})"
+            )
             group_action.setCheckable(True)
             group_action.setChecked(group.id in self.current_form_screen_ids)
-            group_action.setToolTip(", ".join(screen_label_from_id(screen_id, self.screen_aliases, self.all_screen_groups()) for screen_id in group.screen_ids) or group.name)
-            group_action.triggered.connect(lambda checked=False, group_id=group.id: self.toggle_schedule_screen_selection(group_id))
+            group_action.setToolTip(
+                ", ".join(
+                    screen_label_from_id(
+                        screen_id, self.screen_aliases, self.all_screen_groups()
+                    )
+                    for screen_id in group.screen_ids
+                )
+                or group.name
+            )
+            group_action.triggered.connect(
+                lambda checked=False, group_id=group.id: (
+                    self.toggle_schedule_screen_selection(group_id)
+                )
+            )
         self.schedule_screen_menu.addSeparator()
-        for index, target in enumerate(self.unified_screen_targets(include_offline=True), start=1):
+        offline_section_added = False
+        for index, target in enumerate(visible_targets, start=1):
             label = target.label
             if target.kind == "local":
                 local_screen = find_screen_by_id(target.id)
@@ -5045,42 +6719,65 @@ class MainWindow(QMainWindow):
                     geometry = local_screen.geometry()
                     label = f"{target.label} ({geometry.width()}x{geometry.height()})"
             else:
-                transport_label = TRANSPORT_LABELS.get(configured_transport_by_id.get(target.id, "browser"), "Remote")
+                transport_label = TRANSPORT_LABELS.get(
+                    configured_transport_by_id.get(target.id, "browser"), "Remote"
+                )
                 label = f"{target.label} ({transport_label}{' • offline' if not target.online else ''})"
+            if not target.online and not offline_section_added:
+                self.screen_target_menu.addSeparator()
+                self.screen_target_menu.addAction(
+                    "Offline / remembered screens"
+                ).setEnabled(False)
+                self.schedule_screen_menu.addSeparator()
+                self.schedule_screen_menu.addAction(
+                    "Offline / remembered screens"
+                ).setEnabled(False)
+                offline_section_added = True
+
             action = self.screen_target_menu.addAction(label)
             action.setCheckable(True)
             action.setChecked(target.id in self.selected_monitor_ids)
             action.setToolTip(target.warning or target.detail)
-            action.triggered.connect(lambda checked=False, screen_id=target.id: self.toggle_screen_selection(screen_id))
-            rename_action = self.rename_screens_menu.addAction(f"Rename Screen {index} - {target.label}")
-            rename_action.triggered.connect(lambda checked=False, screen_id=target.id: self.rename_screen_alias(screen_id))
+            action.triggered.connect(
+                lambda checked=False, screen_id=target.id: self.toggle_screen_selection(
+                    screen_id
+                )
+            )
+            rename_action = self.rename_screens_menu.addAction(
+                f"Rename Screen {index} - {target.label}"
+            )
+            rename_action.triggered.connect(
+                lambda checked=False, screen_id=target.id: self.rename_screen_alias(
+                    screen_id
+                )
+            )
             schedule_action = self.schedule_screen_menu.addAction(label)
             schedule_action.setCheckable(True)
             schedule_action.setChecked(target.id in self.current_form_screen_ids)
             schedule_action.setToolTip(target.warning or target.detail)
-            schedule_action.triggered.connect(lambda checked=False, screen_id=target.id: self.toggle_schedule_screen_selection(screen_id))
-        for screen_id, state in sorted(self.remote_screens.items(), key=lambda item: friendly_remote_name(item[0], self.screen_aliases, item[1]).lower()):
+            schedule_action.triggered.connect(
+                lambda checked=False, screen_id=target.id: (
+                    self.toggle_schedule_screen_selection(screen_id)
+                )
+            )
+        for screen_id, state in sorted(
+            self.remote_screens.items(),
+            key=lambda item: friendly_remote_name(
+                item[0], self.screen_aliases, item[1]
+            ).lower(),
+        ):
             remote_label = friendly_remote_name(screen_id, self.screen_aliases, state)
             suffix = "online" if state.get("online") else "offline"
-            remote_action = self.remote_screens_menu.addAction(f"{remote_label} ({suffix})")
+            remote_action = self.remote_screens_menu.addAction(
+                f"{remote_label} ({suffix})"
+            )
             remote_action.setEnabled(False)
             detail = str(state.get("ip") or "")
             if int(state.get("width") or 0) and int(state.get("height") or 0):
-                detail = f"{detail} • {int(state.get('width') or 0)}x{int(state.get('height') or 0)}".strip(" •")
+                detail = f"{detail} • {int(state.get('width') or 0)}x{int(state.get('height') or 0)}".strip(
+                    " •"
+                )
             remote_action.setToolTip(detail or screen_id)
-        for usn, device in sorted(self.dlna_devices.items(), key=lambda item: str(item[1].get("friendly_name") or item[0]).lower()):
-            name = str(device.get("friendly_name") or usn)
-            ip = str(device.get("ip") or "")
-            detail = f"DLNA renderer • {ip}" if ip else "DLNA renderer"
-            action = self.dlna_screens_menu.addAction(name)
-            action.setEnabled(False)
-            action.setToolTip(detail)
-        for device_id, device in sorted(self.miracast_devices.items(), key=lambda item: str(item[1].get("friendly_name") or item[0]).lower()):
-            name = str(device.get("friendly_name") or device_id)
-            detail = str(device.get("detail") or "Miracast device")
-            action = self.miracast_screens_menu.addAction(name)
-            action.setEnabled(False)
-            action.setToolTip(detail)
         self.update_monitor_summary()
         self.update_schedule_screen_summary()
         self.refresh_schedule_list()
@@ -5097,12 +6794,20 @@ class MainWindow(QMainWindow):
             self.current_form_screen_ids.remove(screen_id)
         else:
             self.current_form_screen_ids.append(screen_id)
-        self.current_form_screen_ids = normalize_schedule_target_ids(self.current_form_screen_ids)
+        self.current_form_screen_ids = normalize_schedule_target_ids(
+            self.current_form_screen_ids
+        )
         self.refresh_monitors()
 
     def rename_screen_alias(self, screen_id: str) -> None:
         screen = find_screen_by_id(screen_id)
-        default_name = screen.name() if screen is not None else friendly_remote_name(screen_id, self.screen_aliases, self.remote_screens.get(screen_id))
+        default_name = (
+            screen.name()
+            if screen is not None
+            else friendly_remote_name(
+                screen_id, self.screen_aliases, self.remote_screens.get(screen_id)
+            )
+        )
         current_alias = self.screen_aliases.get(screen_id, "")
         new_name, accepted = QInputDialog.getText(
             self,
@@ -5113,18 +6818,273 @@ class MainWindow(QMainWindow):
         if not accepted:
             return
         cleaned = new_name.strip()
-        self.call_backend_action("rename_screen_alias", {"screen_id": screen_id, "alias": cleaned})
+        self.call_backend_action(
+            "rename_screen_alias", {"screen_id": screen_id, "alias": cleaned}
+        )
+
+    def purge_offline_screens(self, checked: bool = False) -> None:
+        response = self.call_backend_action(
+            "purge_remembered_screens", {"include_online": False}
+        )
+        if response is not None:
+            removed = int(response.get("removed") or 0)
+            removed_ids = {
+                screen_id
+                for screen_id in list(self.current_form_screen_ids)
+                if is_remote_screen_id(screen_id)
+                and screen_id not in self.remote_screens
+            }
+            if removed_ids:
+                self.current_form_screen_ids = [
+                    screen_id
+                    for screen_id in self.current_form_screen_ids
+                    if screen_id not in removed_ids
+                ]
+            if removed:
+                self.set_form_message(
+                    f"Purged {removed} offline remembered screen(s).", "success"
+                )
+            else:
+                self.set_form_message(
+                    "No offline remembered screens to purge.", "success"
+                )
+
+    def purge_all_screens(self, checked: bool = False) -> None:
+        confirm = QMessageBox.question(
+            self,
+            "Purge all remembered screens",
+            "This will remove all remembered remote LAN screens (including currently online ones) from saved selections, schedules, and aliases. Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        response = self.call_backend_action(
+            "purge_remembered_screens", {"include_online": True}
+        )
+        if response is not None:
+            removed = int(response.get("removed") or 0)
+            self.current_form_screen_ids = [
+                screen_id
+                for screen_id in self.current_form_screen_ids
+                if not is_remote_screen_id(screen_id)
+            ]
+            self.set_form_message(f"Purged {removed} remembered screen(s).", "success")
+
+    def _apply_duplicate_merge(
+        self, source_id: str, target_id: str
+    ) -> tuple[bool, str]:
+        response = self.call_backend_action(
+            "merge_duplicate_screen",
+            {"source_screen_id": source_id, "target_screen_id": target_id},
+        )
+        if response is None:
+            return False, "Merge failed because the engine is unavailable."
+        merged = bool(response.get("merged"))
+        if merged:
+            message = "Merged duplicate remembered screen into target."
+            self.set_form_message(message, "success")
+            return True, message
+        message = "No merge was applied."
+        self.set_form_message(message, "error")
+        return False, message
+
+    def merge_duplicate_screens(self, checked: bool = False) -> None:
+        remote_ids = sorted(self.remote_screens)
+        if len(remote_ids) < 2:
+            self.set_form_message(
+                "Need at least two remembered remote screens to merge.", "error"
+            )
+            return
+
+        source_labels = [
+            f"{friendly_remote_name(screen_id, self.screen_aliases, self.remote_screens.get(screen_id))} ({screen_id})"
+            for screen_id in remote_ids
+        ]
+        source_label, accepted = QInputDialog.getItem(
+            self,
+            "Merge Duplicate Screens",
+            "Screen to merge from (will be removed):",
+            source_labels,
+            0,
+            False,
+        )
+        if not accepted:
+            return
+        source_index = source_labels.index(source_label)
+        source_id = remote_ids[source_index]
+
+        target_candidates = [
+            screen_id for screen_id in remote_ids if screen_id != source_id
+        ]
+        target_labels = [
+            f"{friendly_remote_name(screen_id, self.screen_aliases, self.remote_screens.get(screen_id))} ({screen_id})"
+            for screen_id in target_candidates
+        ]
+        target_label, accepted = QInputDialog.getItem(
+            self,
+            "Merge Duplicate Screens",
+            "Screen to keep (target):",
+            target_labels,
+            0,
+            False,
+        )
+        if not accepted:
+            return
+        target_index = target_labels.index(target_label)
+        target_id = target_candidates[target_index]
+        self._apply_duplicate_merge(source_id, target_id)
+
+    def open_manage_screens_popup(self, checked: bool = False) -> None:
+        self.refresh_monitors()
+        dialog = ManageScreensWorkspaceDialog(
+            self.unified_screen_targets(include_offline=True),
+            self.selected_monitor_ids,
+            self.enabled_screen_ids,
+            self.screen_aliases,
+            merge_handler=self._apply_duplicate_merge,
+            parent=self,
+        )
+
+        def _sync_dialog_from_controller() -> None:
+            dialog.sync_state(
+                selected_monitor_ids=self.selected_monitor_ids,
+                enabled_screen_ids=self.enabled_screen_ids,
+                screen_aliases=self.screen_aliases,
+            )
+            dialog.replace_targets(self.unified_screen_targets(include_offline=True))
+
+        def _manage_groups() -> None:
+            self.manage_screen_groups()
+            _sync_dialog_from_controller()
+
+        def _manage_configured() -> None:
+            self.manage_configured_screens()
+            _sync_dialog_from_controller()
+
+        def _refresh_workspace() -> None:
+            self.pull_backend_state(initial=False)
+            _sync_dialog_from_controller()
+
+        def _purge_offline() -> None:
+            self.purge_offline_screens()
+            _sync_dialog_from_controller()
+
+        def _purge_all() -> None:
+            self.purge_all_screens()
+            _sync_dialog_from_controller()
+
+        dialog.manage_groups_button.clicked.connect(lambda *_args: _manage_groups())
+        dialog.manage_configured_button.clicked.connect(
+            lambda *_args: _manage_configured()
+        )
+        dialog.refresh_button.clicked.connect(lambda *_args: _refresh_workspace())
+
+        def _merge_duplicates() -> None:
+            self.merge_duplicate_screens()
+            _sync_dialog_from_controller()
+
+        dialog.merge_duplicates_button.clicked.connect(
+            lambda *_args: _merge_duplicates()
+        )
+        dialog.purge_offline_button.clicked.connect(lambda *_args: _purge_offline())
+        dialog.purge_all_button.clicked.connect(lambda *_args: _purge_all())
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            dialog.apply_current()
+            updated_selected = sorted(dialog.selected_monitor_ids)
+            updated_enabled = sorted(dialog.enabled_screen_ids)
+            if updated_selected != sorted(self.selected_monitor_ids):
+                self.call_backend_action(
+                    "set_selected_screens", {"screen_ids": updated_selected}
+                )
+            if updated_enabled != sorted(self.enabled_screen_ids):
+                self.call_backend_action(
+                    "set_enabled_screens", {"screen_ids": updated_enabled}
+                )
+            all_alias_keys = set(self.screen_aliases) | set(dialog.screen_aliases)
+            for screen_id in sorted(all_alias_keys):
+                alias = dialog.screen_aliases.get(screen_id, "")
+                if self.screen_aliases.get(screen_id, "") != alias:
+                    self.call_backend_action(
+                        "rename_screen_alias", {"screen_id": screen_id, "alias": alias}
+                    )
+
+    def open_help_documentation(self, checked: bool = False) -> None:
+        guide_path = APP_ROOT / "docs" / "USER_GUIDE.md"
+        if not guide_path.exists():
+            self.set_form_message(
+                "Help guide file is missing: docs/USER_GUIDE.md", "error"
+            )
+            return
+        try:
+            text = guide_path.read_text(encoding="utf-8")
+        except OSError as error:
+            self.set_form_message(f"Could not load help guide: {error}", "error")
+            return
+        dialog = HelpCenterDialog(text, self)
+        dialog.exec()
+
+    def open_release_checklist(self, checked: bool = False) -> None:
+        checklist_path = APP_ROOT / "docs" / "RELEASE_CHECKLIST.md"
+        if not checklist_path.exists():
+            self.set_form_message(
+                "Release checklist file is missing: docs/RELEASE_CHECKLIST.md", "error"
+            )
+            return
+        try:
+            text = checklist_path.read_text(encoding="utf-8")
+        except OSError as error:
+            self.set_form_message(f"Could not load release checklist: {error}", "error")
+            return
+        dialog = HelpCenterDialog(text, self)
+        dialog.setWindowTitle("Release Checklist")
+        dialog.exec()
+
+    def open_accessibility_review(self, checked: bool = False) -> None:
+        review_path = APP_ROOT / "docs" / "ACCESSIBILITY_CONTRAST_REVIEW.md"
+        if not review_path.exists():
+            self.set_form_message(
+                "Accessibility review file is missing: docs/ACCESSIBILITY_CONTRAST_REVIEW.md",
+                "error",
+            )
+            return
+        try:
+            text = review_path.read_text(encoding="utf-8")
+        except OSError as error:
+            self.set_form_message(
+                f"Could not load accessibility review: {error}", "error"
+            )
+            return
+        dialog = HelpCenterDialog(text, self)
+        dialog.setWindowTitle("Accessibility & Contrast Review")
+        dialog.exec()
 
     def on_transition_changed(self, *_args) -> None:
         self.transition_method = str(self.transition_selector.currentData())
-        self.call_backend_action("set_transition_method", {"transition_method": self.transition_method})
+        if self.transition_method not in TRANSITION_METHODS:
+            self.transition_method = "fade_black"
+        if not self.backend_online:
+            self._pending_transition_method = self.transition_method
+            self.set_form_message(
+                "Transition preference saved locally and will apply when the engine reconnects.",
+                "success",
+            )
+            return
+        response = self.call_backend_action(
+            "set_transition_method", {"transition_method": self.transition_method}
+        )
+        if response is not None:
+            self._pending_transition_method = None
+            self.set_form_message("Transition method updated.", "success")
 
     def choose_quick_play_targets(self, media_path: Path) -> list[str] | None:
         targets = self.unified_screen_targets(include_offline=False)
         if not targets:
             self.set_form_message("No screens are available for quick play.", "error")
             return None
-        dialog = QuickPlayTargetDialog(targets, self.selected_monitor_ids, media_path.name, self)
+        dialog = QuickPlayTargetDialog(
+            targets, self.selected_monitor_ids, media_path.name, self
+        )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return None
         target_ids = dialog.selected_screen_ids()
@@ -5136,12 +7096,16 @@ class MainWindow(QMainWindow):
     def handle_quick_play_drop(self, file_path: str) -> None:
         path = Path(file_path)
         if path.suffix.lower() not in SUPPORTED_MEDIA_EXTENSIONS:
-            self.set_form_message("Dropped file is not a supported media file.", "error")
+            self.set_form_message(
+                "Dropped file is not a supported media file.", "error"
+            )
             return
         target_ids = self.choose_quick_play_targets(path)
         if not target_ids:
             return
-        response = self.call_backend_action("quick_play", {"path": str(path), "target_screen_ids": target_ids})
+        response = self.call_backend_action(
+            "quick_play", {"path": str(path), "target_screen_ids": target_ids}
+        )
         if response is not None:
             self.set_form_message(f"Quick play started with {path.name}.", "success")
 
@@ -5159,15 +7123,28 @@ class MainWindow(QMainWindow):
     def clear_quick_play_target(self) -> None:
         response = self.call_backend_action("clear_quick_play")
         if response is not None:
-            self.set_form_message("Returned all quick-play screens to scheduled playback.", "success")
+            self.set_form_message(
+                "Returned all quick-play screens to scheduled playback.", "success"
+            )
 
     def refresh_schedule_list(self) -> None:
         selected_id = self.current_edit_id
         self.schedule_list.blockSignals(True)
         self.schedule_list.clear()
-        warning_icon = self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxCritical).pixmap(16, 16)
-        screen_icon = self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon).pixmap(16, 16)
-        for entry in sorted(self.schedules, key=lambda item: ScheduleEntry.time_to_minutes(item.start_time)):
+        warning_icon = (
+            self.style()
+            .standardIcon(QStyle.StandardPixmap.SP_MessageBoxCritical)
+            .pixmap(16, 16)
+        )
+        screen_icon = (
+            self.style()
+            .standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+            .pixmap(16, 16)
+        )
+        for entry in sorted(
+            self.schedules,
+            key=lambda item: ScheduleEntry.time_to_minutes(item.start_time),
+        ):
             item = QListWidgetItem()
             missing_screen_ids = []
             for screen_id in entry.screen_ids:
@@ -5180,20 +7157,33 @@ class MainWindow(QMainWindow):
                 elif find_screen_by_id(screen_id) is None:
                     missing_screen_ids.append(screen_id)
             assigned_labels = [
-                friendly_remote_name(screen_id, self.screen_aliases, self.remote_screens.get(screen_id))
+                friendly_remote_name(
+                    screen_id, self.screen_aliases, self.remote_screens.get(screen_id)
+                )
                 if is_remote_screen_id(screen_id)
-                else screen_label_from_id(screen_id, self.screen_aliases, self.all_screen_groups())
+                else screen_label_from_id(
+                    screen_id, self.screen_aliases, self.all_screen_groups()
+                )
                 for screen_id in entry.screen_ids
             ]
             screens_tooltip = "Assigned targets\n" + "\n".join(assigned_labels)
             if missing_screen_ids:
                 missing_labels = [
-                    friendly_remote_name(screen_id, self.screen_aliases, self.remote_screens.get(screen_id))
+                    friendly_remote_name(
+                        screen_id,
+                        self.screen_aliases,
+                        self.remote_screens.get(screen_id),
+                    )
                     if is_remote_screen_id(screen_id)
-                    else screen_label_from_id(screen_id, self.screen_aliases, self.all_screen_groups())
+                    else screen_label_from_id(
+                        screen_id, self.screen_aliases, self.all_screen_groups()
+                    )
                     for screen_id in missing_screen_ids
                 ]
-                warning_tooltip = "One or more attached screens are disconnected.\n\n" + "\n".join(missing_labels)
+                warning_tooltip = (
+                    "One or more attached screens are disconnected.\n\n"
+                    + "\n".join(missing_labels)
+                )
                 row_widget = ScheduleSlotRow(
                     entry.title,
                     f"{entry.days_label} • {entry.range_label}",
@@ -5229,11 +7219,14 @@ class MainWindow(QMainWindow):
         entry = next((item for item in self.schedules if item.id == schedule_id), None)
         if entry is None:
             self.title_input.setText("")
-            self.set_time_button_values(QTime.fromString("00:00", "HH:mm"), QTime.fromString("01:00", "HH:mm"))
+            self.set_time_button_values(
+                QTime.fromString("00:00", "HH:mm"), QTime.fromString("01:00", "HH:mm")
+            )
             for checkbox in self.day_checkboxes.values():
                 checkbox.setChecked(True)
             self.current_form_screen_ids = [DEFAULT_GROUP_ID]
             self.current_selected_video_file = ""
+            self.current_media_assignments = {}
             self.update_media_source_summary()
             self.update_schedule_screen_summary()
             self.refresh_monitors()
@@ -5241,12 +7234,19 @@ class MainWindow(QMainWindow):
             return
 
         self.title_input.setText(entry.title)
-        self.set_time_button_values(QTime.fromString(entry.start_time, "HH:mm"), QTime.fromString(entry.end_time, "HH:mm"))
+        self.set_time_button_values(
+            QTime.fromString(entry.start_time, "HH:mm"),
+            QTime.fromString(entry.end_time, "HH:mm"),
+        )
         selected_days = set(entry.selected_days())
         for day_key, checkbox in self.day_checkboxes.items():
             checkbox.setChecked(day_key in selected_days)
         self.current_form_screen_ids = entry.screen_ids[:]
         self.current_selected_video_file = entry.video_file
+        self.current_media_assignments = {
+            screen_id: ScheduleMediaAssignment.from_dict(assignment.to_dict())
+            for screen_id, assignment in entry.media_assignments.items()
+        }
         self.update_schedule_screen_summary()
         self.refresh_monitors()
         self.update_media_source_summary()
@@ -5309,21 +7309,32 @@ class MainWindow(QMainWindow):
             self.choose_media_button.setText("Change Media")
             self.choose_media_button.setToolTip(f"Selected media: {file_name}")
         else:
-            entry = next((item for item in self.schedules if item.id == self.current_edit_id), None)
+            entry = next(
+                (item for item in self.schedules if item.id == self.current_edit_id),
+                None,
+            )
             if entry is not None and entry.video_file:
                 self.choose_media_button.setText("Change Media")
-                self.choose_media_button.setToolTip(f"Current media: {entry.video_label or entry.video_file}")
+                self.choose_media_button.setToolTip(
+                    f"Current media: {entry.video_label or entry.video_file}"
+                )
             else:
                 self.choose_media_button.setText("Choose Media")
-                self.choose_media_button.setToolTip("Choose a media file from the selected folder.")
+                self.choose_media_button.setToolTip(
+                    "Choose a media file from the selected folder."
+                )
         self.update_selection_summary()
 
     def open_media_picker(self) -> None:
         if self.video_directory is None:
-            self.set_form_message("Set the media folder first from the Library menu.", "error")
+            self.set_form_message(
+                "Set the media folder first from the Library menu.", "error"
+            )
             return
         if self.backend_library_scanning and not self.available_videos:
-            self.set_form_message("Media library is still indexing. Try again in a moment.", "error")
+            self.set_form_message(
+                "Media library is still indexing. Try again in a moment.", "error"
+            )
             return
         if not self.available_videos:
             message = "No supported media files were found in the selected folder."
@@ -5333,15 +7344,116 @@ class MainWindow(QMainWindow):
             return
         initial_selection = self.current_selected_video_file
         if not initial_selection:
-            entry = next((item for item in self.schedules if item.id == self.current_edit_id), None)
+            entry = next(
+                (item for item in self.schedules if item.id == self.current_edit_id),
+                None,
+            )
             initial_selection = entry.video_file if entry is not None else ""
-        dialog = MediaPickerDialog(self.available_videos, self.video_directory, initial_selection, self)
+        dialog = MediaPickerDialog(
+            self.available_videos, self.video_directory, initial_selection, self
+        )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         if dialog.selected_path:
             self.current_selected_video_file = dialog.selected_path
             self.update_media_source_summary()
             self.set_form_message(f"Media selected: {dialog.selected_path}", "success")
+
+    def _relative_media_from_absolute(self, absolute_path: str) -> str:
+        if self.video_directory is None:
+            return ""
+        target = Path(absolute_path)
+        try:
+            return (
+                target.resolve().relative_to(self.video_directory.resolve()).as_posix()
+            )
+        except ValueError:
+            return ""
+
+    def edit_per_screen_media(self) -> None:
+        if self.video_directory is None:
+            self.set_form_message(
+                "Set the media folder first from the Library menu.", "error"
+            )
+            return
+        target_ids = expand_target_ids(
+            self.current_form_screen_ids, self.all_screen_groups()
+        )
+        if not target_ids:
+            self.set_form_message("Choose schedule target screens first.", "error")
+            return
+        picked, accepted = QInputDialog.getItem(
+            self,
+            "Per-Screen Media",
+            "Select screen",
+            [
+                screen_label_from_id(
+                    screen_id, self.screen_aliases, self.all_screen_groups()
+                )
+                + " | "
+                + screen_id
+                for screen_id in target_ids
+            ],
+            0,
+            False,
+        )
+        if not accepted:
+            return
+        selected_screen_id = str(picked).rsplit(" | ", 1)[-1]
+        mode, mode_ok = QInputDialog.getItem(
+            self,
+            "Assignment Mode",
+            "Choose assignment type",
+            ["Single Media", "Cycle Images"],
+            0,
+            False,
+        )
+        if not mode_ok:
+            return
+        if mode == "Cycle Images":
+            files, _ = QFileDialog.getOpenFileNames(
+                self,
+                "Choose Image Set",
+                str(self.video_directory),
+                "Images (*.jpg *.jpeg *.png *.webp *.bmp)",
+            )
+            rel_files = [self._relative_media_from_absolute(item) for item in files]
+            rel_files = [item for item in rel_files if item]
+            if len(rel_files) < 2:
+                self.set_form_message(
+                    "Choose at least 2 images for cycle mode.", "error"
+                )
+                return
+            self.current_media_assignments[selected_screen_id] = (
+                ScheduleMediaAssignment(
+                    screen_id=selected_screen_id,
+                    media_files=rel_files,
+                    mode="cycle",
+                    interval_seconds=10,
+                )
+            )
+            self.set_form_message(
+                f"Saved image cycle override for {selected_screen_id}.", "success"
+            )
+            return
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Choose Media",
+            str(self.video_directory),
+            "Media Files (*.mp4 *.mov *.m4v *.webm *.ogg *.jpg *.jpeg *.png *.webp *.bmp)",
+        )
+        relative = self._relative_media_from_absolute(file_path) if file_path else ""
+        if not relative:
+            return
+        self.current_media_assignments[selected_screen_id] = ScheduleMediaAssignment(
+            screen_id=selected_screen_id,
+            media_files=[relative],
+            mode="single",
+            interval_seconds=10,
+        )
+        self.set_form_message(
+            f"Saved media override for {selected_screen_id}.", "success"
+        )
 
     def set_time_button_values(self, start_time: QTime, end_time: QTime) -> None:
         self.start_time_input.setTime(start_time)
@@ -5350,8 +7462,14 @@ class MainWindow(QMainWindow):
         self.end_time_button.setText(end_time.toString("HH:mm"))
 
     def open_time_picker(self, field: str) -> None:
-        current_time = self.start_time_input.time() if field == "start" else self.end_time_input.time()
-        anchor_button = self.start_time_button if field == "start" else self.end_time_button
+        current_time = (
+            self.start_time_input.time()
+            if field == "start"
+            else self.end_time_input.time()
+        )
+        anchor_button = (
+            self.start_time_button if field == "start" else self.end_time_button
+        )
         dialog = TimePickerDialog("Choose Time", current_time, self)
         popup_origin = anchor_button.mapToGlobal(anchor_button.rect().bottomLeft())
         dialog.move(popup_origin + QPoint(0, 6))
@@ -5370,24 +7488,34 @@ class MainWindow(QMainWindow):
             self.folder_watcher.addPath(str(self.video_directory))
 
     def on_video_directory_changed(self, path: str) -> None:
+        if self._low_value_timers_paused:
+            return
         self.folder_refresh_timer.start()
 
-    def on_schedule_selected(self, current: QListWidgetItem | None, previous: QListWidgetItem | None) -> None:
+    def on_schedule_selected(
+        self, current: QListWidgetItem | None, previous: QListWidgetItem | None
+    ) -> None:
         if current is None:
             return
         self.load_schedule_into_form(str(current.data(Qt.ItemDataRole.UserRole)))
 
-    def launch_selected_monitors(self, checked: bool = False, silent: bool = False) -> None:
+    def launch_selected_monitors(
+        self, checked: bool = False, silent: bool = False
+    ) -> None:
         response = self.call_backend_action("launch_selected")
         if response is not None and not silent:
             self.set_form_message("Playback started.", "success")
 
     def build_candidate_from_form(self) -> ScheduleEntry:
-        existing = next((item for item in self.schedules if item.id == self.current_edit_id), None)
+        existing = next(
+            (item for item in self.schedules if item.id == self.current_edit_id), None
+        )
         schedule_id = self.current_edit_id or uuid.uuid4().hex
         title = self.title_input.text().strip()
         fallback_title = title
-        selected_video_file = self.current_selected_video_file or (existing.video_file if existing is not None else "")
+        selected_video_file = self.current_selected_video_file or (
+            existing.video_file if existing is not None else ""
+        )
         if not fallback_title and selected_video_file:
             fallback_title = Path(selected_video_file).stem
         elif not fallback_title and existing is not None:
@@ -5399,7 +7527,9 @@ class MainWindow(QMainWindow):
         video_label = selected_video_file if selected_video_file else ""
         target_ids = normalize_schedule_target_ids(self.current_form_screen_ids)
         if not target_ids:
-            raise ValueError("Choose at least one target screen or screen group for this schedule.")
+            raise ValueError(
+                "Choose at least one target screen or screen group for this schedule."
+            )
 
         return ScheduleEntry(
             id=schedule_id,
@@ -5409,13 +7539,23 @@ class MainWindow(QMainWindow):
             video_file=video_file,
             video_label=video_label,
             screen_ids=target_ids,
-            days=[day_key for day_key, checkbox in self.day_checkboxes.items() if checkbox.isChecked()],
+            days=[
+                day_key
+                for day_key, checkbox in self.day_checkboxes.items()
+                if checkbox.isChecked()
+            ],
+            media_assignments={
+                screen_id: ScheduleMediaAssignment.from_dict(assignment.to_dict())
+                for screen_id, assignment in self.current_media_assignments.items()
+            },
         )
 
     def save_schedule(self) -> None:
         try:
             candidate = self.build_candidate_from_form()
-            response = self.call_backend_action("save_schedule", {"schedule": candidate.to_dict()})
+            response = self.call_backend_action(
+                "save_schedule", {"schedule": candidate.to_dict()}
+            )
             if response is not None:
                 self.current_edit_id = candidate.id
                 self.set_form_message(
@@ -5429,84 +7569,196 @@ class MainWindow(QMainWindow):
         if self.current_edit_id is None:
             return
         current_id = self.current_edit_id
-        response = self.call_backend_action("delete_schedule", {"schedule_id": current_id})
+        response = self.call_backend_action(
+            "delete_schedule", {"schedule_id": current_id}
+        )
         if response is not None:
             self.current_edit_id = None
             self.set_form_message("Schedule deleted.", "success")
 
     def apply_backend_snapshot(self, snapshot: dict[str, Any]) -> None:
         should_reload_form = False
+        should_refresh_monitors = False
+        should_update_network = False
+        should_update_diagnostics = False
+        should_update_status = False
+        should_update_playback_label = False
         self.backend_online = True
-        self.backend_state_version = int(snapshot.get("stateVersion") or self.backend_state_version)
+        self.backend_state_version = int(
+            snapshot.get("stateVersion") or self.backend_state_version
+        )
+        channel_versions = snapshot.get("channelVersions") or {}
+        for name in STATE_CHANNELS:
+            self.backend_channel_versions[name] = max(
+                int(self.backend_channel_versions.get(name) or 0),
+                int(channel_versions.get(name) or 0),
+            )
         self.backend_listener.seed_state_version(self.backend_state_version)
-        self.configured_screens = parse_configured_screens(snapshot.get("configuredScreens"))
-        self.screen_groups = parse_screen_groups(snapshot.get("screenGroups"))
-        schedules_payload = snapshot.get("schedules") or []
-        self.schedules = [ScheduleEntry.from_dict(item) for item in schedules_payload if isinstance(item, dict)]
-        self.selected_monitor_ids = [str(item) for item in snapshot.get("selectedMonitorIds") or []]
-        video_directory = str(snapshot.get("videoDirectory") or "").strip()
-        self.video_directory = Path(video_directory).expanduser() if video_directory else None
-        if self.video_directory is not None and not self.video_directory.exists():
-            self.video_directory = None
-        self.screen_aliases = {str(key): str(value) for key, value in (snapshot.get("screenAliases") or {}).items()}
-        self.screen_aliases.update(configured_screen_name_map(self.configured_screens))
-        self.transition_method = str(snapshot.get("transitionMethod") or "fade_black")
-        self.run_at_startup = bool(snapshot.get("runAtStartup"))
-        available_media = snapshot.get("availableMedia") or []
-        if self.video_directory is not None:
-            self.available_videos = [self.video_directory / str(item.get("relativePath") or "") for item in available_media if item.get("relativePath")]
+        self.backend_listener.seed_channel_versions(self.backend_channel_versions)
+
+        channels = snapshot.get("channels")
+        if isinstance(channels, list) and channels:
+            changed_channels = {str(item) for item in channels}
         else:
-            self.available_videos = []
-        self.remote_screens = {
-            str(item.get("screen_id")): item
-            for item in snapshot.get("remoteScreens") or []
-            if isinstance(item, dict) and item.get("screen_id")
-        }
-        self.dlna_devices = {
-            str(item.get("usn")): item
-            for item in snapshot.get("dlnaDevices") or []
-            if isinstance(item, dict) and item.get("usn")
-        }
-        self.miracast_devices = {
-            str(item.get("device_id")): item
-            for item in snapshot.get("miracastDevices") or []
-            if isinstance(item, dict) and item.get("device_id")
-        }
-        self.backend_network_snapshot = dict(snapshot.get("network") or {})
-        library = snapshot.get("library") or {}
-        self.backend_library_scanning = bool(library.get("scanning"))
-        self.backend_library_error = str(library.get("error") or "")
+            changed_channels = set(STATE_CHANNELS)
 
-        playback = snapshot.get("playback") or {}
-        self.backend_playback_enabled = bool(playback.get("enabled"))
-        self.backend_paused = bool(playback.get("paused"))
-        self.backend_window_count = int(playback.get("localWindowCount") or 0)
+        if "config" in changed_channels:
+            previous_configured = [
+                screen.to_dict() for screen in self.configured_screens
+            ]
+            previous_groups = [group.to_dict() for group in self.screen_groups]
+            previous_schedule_ids = [entry.id for entry in self.schedules]
+            previous_selected = list(self.selected_monitor_ids)
+            previous_enabled = list(self.enabled_screen_ids)
+            previous_aliases = dict(self.screen_aliases)
 
-        self.run_at_startup_action.blockSignals(True)
-        self.run_at_startup_action.setChecked(self.run_at_startup)
-        self.run_at_startup_action.blockSignals(False)
+            self.configured_screens = parse_configured_screens(
+                snapshot.get("configuredScreens")
+            )
+            self.screen_groups = parse_screen_groups(snapshot.get("screenGroups"))
+            schedules_payload = snapshot.get("schedules") or []
+            self.schedules = [
+                ScheduleEntry.from_dict(item)
+                for item in schedules_payload
+                if isinstance(item, dict)
+            ]
+            self.selected_monitor_ids = [
+                str(item) for item in snapshot.get("selectedMonitorIds") or []
+            ]
+            self.enabled_screen_ids = [
+                str(item) for item in snapshot.get("enabledScreenIds") or []
+            ]
+            video_directory = str(snapshot.get("videoDirectory") or "").strip()
+            self.video_directory = (
+                Path(video_directory).expanduser() if video_directory else None
+            )
+            if self.video_directory is not None and not self.video_directory.exists():
+                self.video_directory = None
+            self.screen_aliases = {
+                str(key): str(value)
+                for key, value in (snapshot.get("screenAliases") or {}).items()
+            }
+            self.screen_aliases.update(
+                self.screen_registry.configured_screen_name_map()
+            )
+            self.transition_method = str(
+                snapshot.get("transitionMethod") or "fade_black"
+            )
+            self.run_at_startup = bool(snapshot.get("runAtStartup"))
+            self.lan_pairing_required = bool(snapshot.get("lanPairingRequired"))
+            self.lan_allow_unpaired_clients = bool(
+                snapshot.get("lanAllowUnpairedClients")
+            )
+            self.lan_paired_client_ids = [
+                str(item).strip()
+                for item in (snapshot.get("lanPairedClientIds") or [])
+                if str(item).strip()
+            ]
 
-        transition_index = self.transition_selector.findData(self.transition_method)
-        if transition_index >= 0 and transition_index != self.transition_selector.currentIndex():
-            self.transition_selector.blockSignals(True)
-            self.transition_selector.setCurrentIndex(transition_index)
-            self.transition_selector.blockSignals(False)
+            self.run_at_startup_action.blockSignals(True)
+            self.run_at_startup_action.setChecked(self.run_at_startup)
+            self.run_at_startup_action.blockSignals(False)
 
-        existing_ids = {entry.id for entry in self.schedules}
-        if self.current_edit_id and self.current_edit_id not in existing_ids:
-            self.current_edit_id = None
-            should_reload_form = True
-        if self.current_edit_id is None and self.schedules:
-            self.current_edit_id = self.schedules[0].id
-            should_reload_form = True
+            transition_index = self.transition_selector.findData(self.transition_method)
+            if (
+                transition_index >= 0
+                and transition_index != self.transition_selector.currentIndex()
+            ):
+                self.transition_selector.blockSignals(True)
+                self.transition_selector.setCurrentIndex(transition_index)
+                self.transition_selector.blockSignals(False)
 
-        self.refresh_monitors()
+            existing_ids = {entry.id for entry in self.schedules}
+            if self.current_edit_id and self.current_edit_id not in existing_ids:
+                self.current_edit_id = None
+                should_reload_form = True
+            if self.current_edit_id is None and self.schedules:
+                self.current_edit_id = self.schedules[0].id
+                should_reload_form = True
+
+            should_refresh_monitors = (
+                should_refresh_monitors
+                or previous_configured
+                != [screen.to_dict() for screen in self.configured_screens]
+                or previous_groups != [group.to_dict() for group in self.screen_groups]
+                or previous_schedule_ids != [entry.id for entry in self.schedules]
+                or previous_selected != list(self.selected_monitor_ids)
+                or previous_enabled != list(self.enabled_screen_ids)
+                or previous_aliases != dict(self.screen_aliases)
+            )
+
+        if "library" in changed_channels:
+            available_media = snapshot.get("availableMedia") or []
+            if self.video_directory is not None:
+                self.available_videos = [
+                    self.video_directory / str(item.get("relativePath") or "")
+                    for item in available_media
+                    if item.get("relativePath")
+                ]
+            else:
+                self.available_videos = []
+            library = snapshot.get("library") or {}
+            self.backend_library_scanning = bool(library.get("scanning"))
+            self.backend_library_error = str(library.get("error") or "")
+            should_update_diagnostics = True
+
+        if "runtime" in changed_channels:
+            previous_remote = dict(self.remote_screens)
+            previous_network = dict(self.backend_network_snapshot)
+            previous_paused = bool(self.backend_paused)
+            previous_playback_enabled = bool(self.backend_playback_enabled)
+            previous_window_count = int(self.backend_window_count)
+
+            self.remote_screens = {
+                str(item.get("screen_id")): item
+                for item in snapshot.get("remoteScreens") or []
+                if isinstance(item, dict) and item.get("screen_id")
+            }
+            self.backend_network_snapshot = dict(snapshot.get("network") or {})
+            playback = snapshot.get("playback") or {}
+            self.backend_playback_enabled = bool(playback.get("enabled"))
+            self.backend_paused = bool(playback.get("paused"))
+            self.backend_window_count = int(playback.get("localWindowCount") or 0)
+
+            should_refresh_monitors = (
+                should_refresh_monitors or previous_remote != self.remote_screens
+            )
+            should_update_network = (
+                should_update_network
+                or previous_network != self.backend_network_snapshot
+                or previous_remote != self.remote_screens
+            )
+            should_update_playback_label = (
+                should_update_playback_label
+                or previous_paused != self.backend_paused
+                or previous_playback_enabled != self.backend_playback_enabled
+                or previous_window_count != self.backend_window_count
+            )
+            should_update_status = True
+
+        previous_performance = dict(self.backend_performance_metrics)
+        self.backend_performance_metrics = dict(snapshot.get("performance") or {})
+        if previous_performance != self.backend_performance_metrics:
+            should_update_diagnostics = True
+
+        if should_refresh_monitors:
+            self.refresh_monitors()
         if should_reload_form:
             self.load_schedule_into_form(self.current_edit_id)
         status = snapshot.get("status") or {}
-        self.update_status_labels(str(status.get("clockLabel") or "--:--:--"), str(status.get("activeLabel") or "No active schedule"))
-        self.update_playback_state_label(self.backend_paused, self.backend_window_count)
-        self.update_network_summary()
+        if should_update_status and status:
+            self.update_status_labels(
+                str(status.get("clockLabel") or "--:--:--"),
+                str(status.get("activeLabel") or "No active schedule"),
+            )
+        if should_update_playback_label or should_update_status:
+            self.update_playback_state_label(
+                self.backend_paused, self.backend_window_count
+            )
+        if should_update_network:
+            self.update_network_summary()
+        if should_update_diagnostics:
+            self.update_engine_diagnostics_summary()
 
     def update_status_labels(self, clock_label: str, active_label: str) -> None:
         if not hasattr(self, "footer_time_primary"):
@@ -5514,7 +7766,9 @@ class MainWindow(QMainWindow):
         self.footer_time_primary.setText(clock_label)
         if active_label == "Playback stopped":
             self.hero_title_label.setText("Playback stopped")
-            self.hero_subtitle_label.setText("Screens remain idle until you launch playback again.")
+            self.hero_subtitle_label.setText(
+                "Screens remain idle until you launch playback again."
+            )
             self.update_hero_progress(0.0)
             return
         now = current_uk_datetime()
@@ -5524,16 +7778,31 @@ class MainWindow(QMainWindow):
             (
                 entry
                 for screen_id in self.selected_monitor_ids
-                if (entry := active_schedule_for_screen(self.schedules, weekday_index, minute_of_day, screen_id, self.all_screen_groups())) is not None
+                if (
+                    entry := active_schedule_for_screen(
+                        self.schedules,
+                        weekday_index,
+                        minute_of_day,
+                        screen_id,
+                        self.all_screen_groups(),
+                    )
+                )
+                is not None
             ),
             active_schedule_for_minute(self.schedules, weekday_index, minute_of_day),
         )
         if active_entry is None:
-            self.hero_title_label.setText(active_label if active_label != "No active schedule" else "No active slot")
+            self.hero_title_label.setText(
+                active_label
+                if active_label != "No active schedule"
+                else "No active slot"
+            )
             self.hero_subtitle_label.setText("Waiting for a matching UK-time schedule.")
             self.update_hero_progress(0.0)
         else:
-            self.hero_title_label.setText(f"{active_entry.title} • {active_entry.range_label} • {active_entry.video_label or active_entry.video_file}")
+            self.hero_title_label.setText(
+                f"{active_entry.title} • {active_entry.range_label} • {active_entry.video_label or active_entry.video_file}"
+            )
             self.hero_subtitle_label.setText(
                 f"Transition: {TRANSITION_METHODS.get(self.transition_method, 'Fade Through Black')} • "
                 f"Media folder: {self.video_directory if self.video_directory is not None else 'Not set'}"
@@ -5546,7 +7815,9 @@ class MainWindow(QMainWindow):
         remote_active = sum(
             1
             for state in self.remote_screens.values()
-            if state.get("online") and str(state.get("state") or "") in {"playing", "connected"} and str(state.get("current_media") or "")
+            if state.get("online")
+            and str(state.get("state") or "") in {"playing", "connected"}
+            and str(state.get("current_media") or "")
         )
         total_active = window_count + remote_active
         self.current_active_screen_count = total_active
@@ -5609,12 +7880,17 @@ class MainWindow(QMainWindow):
         else:
             selected_names = [
                 (
-                    friendly_remote_name(screen_id, self.screen_aliases, self.remote_screens.get(screen_id))
+                    friendly_remote_name(
+                        screen_id,
+                        self.screen_aliases,
+                        self.remote_screens.get(screen_id),
+                    )
                     if is_remote_screen_id(screen_id)
                     else screen_display_name(screen, self.screen_aliases)
                 )
                 for screen_id in self.selected_monitor_ids
-                if is_remote_screen_id(screen_id) or (screen := find_screen_by_id(screen_id)) is not None
+                if is_remote_screen_id(screen_id)
+                or (screen := find_screen_by_id(screen_id)) is not None
             ]
             global_tooltip = (
                 "Default playback group\n"
@@ -5630,7 +7906,9 @@ class MainWindow(QMainWindow):
             if widget is not None:
                 widget.setToolTip(global_tooltip)
         if hasattr(self, "footer_active_primary"):
-            self.footer_active_primary.setText(f"{self.current_active_screen_count} active")
+            self.footer_active_primary.setText(
+                f"{self.current_active_screen_count} active"
+            )
             if self.current_active_screen_count == 0:
                 self.footer_active_secondary.setText("No active playback")
             elif self.backend_paused:
@@ -5642,7 +7920,9 @@ class MainWindow(QMainWindow):
     def update_schedule_screen_summary(self) -> None:
         if not hasattr(self, "schedule_screen_summary_label"):
             return
-        target_label = format_screen_targets(self.current_form_screen_ids, self.screen_aliases, self.all_screen_groups())
+        target_label = format_screen_targets(
+            self.current_form_screen_ids, self.screen_aliases, self.all_screen_groups()
+        )
         self.schedule_screen_summary_label.setText(target_label)
         if hasattr(self, "schedule_screen_button"):
             self.schedule_screen_button.setText(
@@ -5652,16 +7932,44 @@ class MainWindow(QMainWindow):
             )
         self.update_selection_summary()
 
+    def update_engine_diagnostics_summary(self) -> None:
+        if not hasattr(self, "footer_diagnostics_primary"):
+            return
+        primary, secondary, tooltip = format_engine_diagnostics_summary(
+            self.backend_performance_metrics,
+            scanning=self.backend_library_scanning,
+            library_error=self.backend_library_error,
+        )
+        self.footer_diagnostics_primary.setText(primary)
+        self.footer_diagnostics_secondary.setText(secondary)
+        for widget in (
+            getattr(self, "footer_diagnostics_icon", None),
+            getattr(self, "footer_diagnostics_primary", None),
+            getattr(self, "footer_diagnostics_secondary", None),
+        ):
+            if widget is not None:
+                widget.setToolTip(tooltip)
+
     def update_library_summary(self) -> None:
         if self.video_directory is None:
             self.choose_media_button.setEnabled(True)
             existing_tooltip = self.choose_media_button.toolTip().strip()
-            if existing_tooltip in {"", "Choose a media file from the selected folder."}:
-                self.choose_media_button.setToolTip("No media folder selected. Use Library > Set Media Folder.")
+            if existing_tooltip in {
+                "",
+                "Choose a media file from the selected folder.",
+            }:
+                self.choose_media_button.setToolTip(
+                    "No media folder selected. Use Library > Set Media Folder."
+                )
             return
         unique_files = sorted(referenced_video_files(self.schedules))
         available_count = len(self.available_videos)
-        category_count = len({media_category_label(path, self.video_directory) for path in self.available_videos})
+        category_count = len(
+            {
+                media_category_label(path, self.video_directory)
+                for path in self.available_videos
+            }
+        )
         existing_tooltip = self.choose_media_button.toolTip().strip()
         if self.backend_library_scanning:
             self.choose_media_button.setToolTip(
@@ -5669,9 +7977,15 @@ class MainWindow(QMainWindow):
             )
             return
         if self.backend_library_error:
-            self.choose_media_button.setToolTip(f"Media indexing error: {self.backend_library_error}")
+            self.choose_media_button.setToolTip(
+                f"Media indexing error: {self.backend_library_error}"
+            )
             return
-        if not self.current_selected_video_file and "Current media:" not in existing_tooltip and "Selected media:" not in existing_tooltip:
+        if (
+            not self.current_selected_video_file
+            and "Current media:" not in existing_tooltip
+            and "Selected media:" not in existing_tooltip
+        ):
             self.choose_media_button.setToolTip(
                 f"{available_count} media file(s) across {category_count} folder group(s) • {len(unique_files)} linked."
             )
@@ -5679,12 +7993,24 @@ class MainWindow(QMainWindow):
     def update_selection_summary(self) -> None:
         if not hasattr(self, "schedule_screen_button"):
             return
-        target_label = format_screen_targets(self.current_form_screen_ids, self.screen_aliases, self.all_screen_groups())
-        transition_label = TRANSITION_METHODS.get(self.transition_method, "Fade Through Black")
+        target_label = format_screen_targets(
+            self.current_form_screen_ids, self.screen_aliases, self.all_screen_groups()
+        )
+        transition_label = TRANSITION_METHODS.get(
+            self.transition_method, "Fade Through Black"
+        )
         self.schedule_screen_button.setToolTip(f"Target screens: {target_label}")
         self.transition_selector.setToolTip(f"Transition: {transition_label}")
 
     def closeEvent(self, event: QCloseEvent) -> None:  # type: ignore[override]
+        if not self._allow_real_quit:
+            self.prepare_for_exit(stop_engine=False)
+            self._allow_real_quit = True
+            event.accept()
+            app = QApplication.instance()
+            if app is not None:
+                app.exit(0)
+            return
         self.prepare_for_exit(stop_engine=True)
         self._allow_real_quit = True
         event.accept()
@@ -5696,6 +8022,11 @@ class MainWindow(QMainWindow):
             self.fullscreen_action.blockSignals(True)
             self.fullscreen_action.setChecked(self.isFullScreen())
             self.fullscreen_action.blockSignals(False)
+        if event.type() == QEvent.Type.WindowStateChange:
+            if self.isMinimized():
+                self._set_low_value_timers_paused(True)
+            elif self.isVisible():
+                self._set_low_value_timers_paused(False)
         if (
             event.type() == QEvent.Type.WindowStateChange
             and self.isMinimized()
@@ -5714,13 +8045,19 @@ class MainWindow(QMainWindow):
 
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
+        if not self.isMinimized():
+            self._set_low_value_timers_paused(False)
         self.schedule_layout_refresh()
 
     def update_hero_progress(self, progress: float) -> None:
         self._hero_progress = max(0.0, min(progress, 1.0))
         track_width = self.hero_progress_track.width()
-        fill_width = max(10 if self._hero_progress > 0 else 0, int(track_width * self._hero_progress))
-        self.hero_progress_fill.setGeometry(0, 0, fill_width, self.hero_progress_track.height())
+        fill_width = max(
+            10 if self._hero_progress > 0 else 0, int(track_width * self._hero_progress)
+        )
+        self.hero_progress_fill.setGeometry(
+            0, 0, fill_width, self.hero_progress_track.height()
+        )
 
     def schedule_layout_refresh(self) -> None:
         for delay in (0, 40, 120, 260):
@@ -5729,7 +8066,11 @@ class MainWindow(QMainWindow):
     def refresh_responsive_layout(self) -> None:
         if not hasattr(self, "content_splitter"):
             return
-        screen = self.windowHandle().screen() if self.windowHandle() is not None else self.screen()
+        screen = (
+            self.windowHandle().screen()
+            if self.windowHandle() is not None
+            else self.screen()
+        )
         screen_width = 0
         if screen is not None:
             screen_width = screen.availableGeometry().width()
@@ -5747,8 +8088,7 @@ class MainWindow(QMainWindow):
             left_width = min(max(280, int(width * 0.32)), 360)
         right_width = max(620, width - left_width - 96)
         should_update = (
-            mode != self._layout_mode
-            or abs(width - self._last_layout_width) > 24
+            mode != self._layout_mode or abs(width - self._last_layout_width) > 24
         )
         if should_update:
             self.content_splitter.setSizes([left_width, right_width])
@@ -5760,7 +8100,10 @@ class MainWindow(QMainWindow):
         self.schedule_screen_button.updateGeometry()
         self.choose_media_button.updateGeometry()
         self.transition_selector.updateGeometry()
-        if self.centralWidget() is not None and self.centralWidget().layout() is not None:
+        if (
+            self.centralWidget() is not None
+            and self.centralWidget().layout() is not None
+        ):
             self.centralWidget().layout().activate()
 
 
@@ -5769,7 +8112,10 @@ def current_uk_time_status(schedules: list[ScheduleEntry]) -> tuple[str, str]:
     entry = active_schedule_for_minute(schedules, weekday_index, minute_of_day)
     if entry is None:
         return clock_label, "No active schedule"
-    return clock_label, f"{entry.title} • {entry.range_label} • {entry.video_label or entry.video_file}"
+    return (
+        clock_label,
+        f"{entry.title} • {entry.range_label} • {entry.video_label or entry.video_file}",
+    )
 
 
 def acquire_engine_instance_lock() -> Any | None:
@@ -5875,7 +8221,9 @@ def discover_engine_process_ids() -> list[int]:
                 "-NoProfile",
                 "-Command",
                 (
-                    "$script = [regex]::Escape('" + script_path.replace("'", "''") + "'); "
+                    "$script = [regex]::Escape('"
+                    + script_path.replace("'", "''")
+                    + "'); "
                     "Get-CimInstance Win32_Process | "
                     "Where-Object { $_.Name -match 'pythonw?\\.exe' -and $_.CommandLine -match $script -and $_.CommandLine -match '--engine' } | "
                     "Select-Object -ExpandProperty ProcessId"
@@ -5961,17 +8309,28 @@ def stop_engine_from_lock() -> bool:
     return stopped
 
 
+STATE_CHANNELS = ("config", "library", "runtime")
+
+
 class ControllerApiClient:
     def __init__(self, port: int = ENGINE_CONTROL_PORT) -> None:
         self.base_url = f"http://127.0.0.1:{port}"
 
-    def _request(self, method: str, path: str, payload: dict[str, Any] | None = None, timeout: float = 5.0) -> dict[str, Any]:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+        timeout: float = 5.0,
+    ) -> dict[str, Any]:
         data = None
         headers = {"Accept": "application/json"}
         if payload is not None:
             data = json.dumps(payload).encode("utf-8")
             headers["Content-Type"] = "application/json"
-        request = Request(f"{self.base_url}{path}", data=data, method=method, headers=headers)
+        request = Request(
+            f"{self.base_url}{path}", data=data, method=method, headers=headers
+        )
         with urlopen(request, timeout=timeout) as response:
             raw = response.read().decode("utf-8")
         result = json.loads(raw) if raw else {}
@@ -5987,19 +8346,62 @@ class ControllerApiClient:
     def get_state(self) -> dict[str, Any]:
         return self._request("GET", "/api/state")
 
-    def wait_for_state_update(self, since: int, timeout: float = 30.0) -> dict[str, Any]:
+    def wait_for_state_update(
+        self,
+        since: int,
+        timeout: float = 30.0,
+        channel_versions: dict[str, int] | None = None,
+    ) -> dict[str, Any]:
         timeout_ms = max(1000, int(timeout * 1000))
-        return self._request("GET", f"/api/subscribe?since={int(since)}&timeout_ms={timeout_ms}", timeout=timeout + 5.0)
+        versions = channel_versions or {}
+        query = (
+            f"since={int(since)}&timeout_ms={timeout_ms}"
+            f"&c_config={max(0, int(versions.get('config') or 0))}"
+            f"&c_library={max(0, int(versions.get('library') or 0))}"
+            f"&c_runtime={max(0, int(versions.get('runtime') or 0))}"
+        )
+        return self._request(
+            "GET",
+            f"/api/subscribe?{query}",
+            timeout=timeout + 5.0,
+        )
 
-    def action(self, action: str, payload: dict[str, Any] | None = None, timeout: float = 5.0) -> dict[str, Any]:
-        return self._request("POST", "/api/action", {"action": action, "payload": payload or {}}, timeout=timeout)
+    def wait_for_local_worker_command(
+        self,
+        screen_id: str,
+        since_version: int,
+        timeout: float = 25.0,
+    ) -> dict[str, Any]:
+        timeout_ms = max(1000, int(timeout * 1000))
+        query = (
+            f"screen_id={quote(str(screen_id))}"
+            f"&since={max(0, int(since_version))}"
+            f"&timeout_ms={timeout_ms}"
+        )
+        return self._request(
+            "GET",
+            f"/api/local-worker-command?{query}",
+            timeout=timeout + 5.0,
+        )
+
+    def action(
+        self, action: str, payload: dict[str, Any] | None = None, timeout: float = 5.0
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            "/api/action",
+            {"action": action, "payload": payload or {}},
+            timeout=timeout,
+        )
 
 
 class BackendStateListener(QObject):
     snapshot_received = Signal(dict)
     connection_changed = Signal(bool, str)
 
-    def __init__(self, client: ControllerApiClient, parent: QObject | None = None) -> None:
+    def __init__(
+        self, client: ControllerApiClient, parent: QObject | None = None
+    ) -> None:
         super().__init__(parent)
         self.client = client
         self._stop_event = threading.Event()
@@ -6008,12 +8410,15 @@ class BackendStateListener(QObject):
         self._last_version = 0
         self._online = False
         self._consecutive_failures = 0
+        self._channel_versions = {name: 0 for name in STATE_CHANNELS}
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop_event.clear()
-        self._thread = threading.Thread(target=self._run, name="backend-state-listener", daemon=True)
+        self._thread = threading.Thread(
+            target=self._run, name="backend-state-listener", daemon=True
+        )
         self._thread.start()
 
     def stop(self) -> None:
@@ -6026,6 +8431,14 @@ class BackendStateListener(QObject):
         with self._cursor_lock:
             self._last_version = max(0, int(version))
 
+    def seed_channel_versions(self, versions: dict[str, Any] | None) -> None:
+        incoming = versions or {}
+        with self._cursor_lock:
+            for name in STATE_CHANNELS:
+                self._channel_versions[name] = max(
+                    0, int(incoming.get(name) or self._channel_versions.get(name) or 0)
+                )
+
     def _emit_connection(self, online: bool, detail: str = "") -> None:
         if self._online == online and not detail:
             return
@@ -6036,12 +8449,23 @@ class BackendStateListener(QObject):
         while not self._stop_event.is_set():
             with self._cursor_lock:
                 since = self._last_version
+                channel_versions = dict(self._channel_versions)
             try:
-                response = self.client.wait_for_state_update(since, timeout=20.0)
+                response = self.client.wait_for_state_update(
+                    since,
+                    timeout=20.0,
+                    channel_versions=channel_versions,
+                )
                 self._consecutive_failures = 0
                 version = int(response.get("stateVersion") or since)
+                channel_versions_response = response.get("channelVersions") or {}
                 with self._cursor_lock:
                     self._last_version = max(self._last_version, version)
+                    for name in STATE_CHANNELS:
+                        self._channel_versions[name] = max(
+                            self._channel_versions.get(name, 0),
+                            int(channel_versions_response.get(name) or 0),
+                        )
                 snapshot = response.get("snapshot")
                 if response.get("updated") and isinstance(snapshot, dict):
                     self.snapshot_received.emit(snapshot)
@@ -6058,7 +8482,9 @@ class BackendStateListener(QObject):
 
 
 class EngineControlServer:
-    def __init__(self, engine: "ControllerEngine", port: int = ENGINE_CONTROL_PORT) -> None:
+    def __init__(
+        self, engine: "ControllerEngine", port: int = ENGINE_CONTROL_PORT
+    ) -> None:
         self.engine = engine
         self.port = port
         self._httpd: ThreadingHTTPServer | None = None
@@ -6089,8 +8515,12 @@ class EngineControlServer:
         except OSError as error:
             self.server_error = str(error)
             self._httpd = None
-            raise RuntimeError(f"Engine control server failed to bind to 127.0.0.1:{self.port}: {error}") from error
-        self._thread = threading.Thread(target=self._httpd.serve_forever, name="controller-engine-api", daemon=True)
+            raise RuntimeError(
+                f"Engine control server failed to bind to 127.0.0.1:{self.port}: {error}"
+            ) from error
+        self._thread = threading.Thread(
+            target=self._httpd.serve_forever, name="controller-engine-api", daemon=True
+        )
         self._thread.start()
 
     def stop(self) -> None:
@@ -6103,7 +8533,12 @@ class EngineControlServer:
             self._thread.join(timeout=1.0)
         self._thread = None
 
-    def _write_json(self, handler: BaseHTTPRequestHandler, payload: dict[str, Any], status: int = HTTPStatus.OK) -> None:
+    def _write_json(
+        self,
+        handler: BaseHTTPRequestHandler,
+        payload: dict[str, Any],
+        status: int = HTTPStatus.OK,
+    ) -> None:
         body = json.dumps(payload).encode("utf-8")
         handler.send_response(int(status))
         handler.send_header("Content-Type", "application/json; charset=utf-8")
@@ -6130,7 +8565,12 @@ class EngineControlServer:
                 self._write_json(handler, {"ok": True, "server": "engine"})
                 return
             if parsed.path == "/api/state":
-                self._write_json(handler, self.engine.run_on_engine_thread(self.engine.snapshot))
+                self._write_json(
+                    handler,
+                    self.engine.run_on_engine_thread(
+                        lambda: self.engine.snapshot_for_channels(None)
+                    ),
+                )
                 return
             if parsed.path == "/api/subscribe":
                 params = parse_qs(parsed.query)
@@ -6143,25 +8583,83 @@ class EngineControlServer:
                 except ValueError:
                     timeout_ms = 20000
                 timeout_seconds = min(max(timeout_ms / 1000.0, 1.0), 30.0)
-                updated, version = self.engine.wait_for_state_update(since, timeout_seconds)
+
+                def _parse_channel_version(param: str) -> int:
+                    try:
+                        raw = str((params.get(param) or ["0"])[0])
+                        return max(0, int(raw))
+                    except (TypeError, ValueError):
+                        return 0
+
+                client_channel_versions = {
+                    "config": _parse_channel_version("c_config"),
+                    "library": _parse_channel_version("c_library"),
+                    "runtime": _parse_channel_version("c_runtime"),
+                }
+                updated, version = self.engine.wait_for_state_update(
+                    since, timeout_seconds
+                )
                 payload: dict[str, Any] = {
                     "ok": True,
                     "updated": updated,
                     "stateVersion": version,
+                    "channelVersions": self.engine.run_on_engine_thread(
+                        self.engine.channel_versions_snapshot
+                    ),
                 }
                 if updated:
-                    payload["snapshot"] = self.engine.run_on_engine_thread(self.engine.snapshot)
+                    payload["snapshot"] = self.engine.run_on_engine_thread(
+                        lambda: self.engine.snapshot_for_channels(
+                            client_channel_versions
+                        )
+                    )
                 self._write_json(handler, payload)
                 return
-            self._write_json(handler, {"ok": False, "error": "not_found"}, HTTPStatus.NOT_FOUND)
+            if parsed.path == "/api/local-worker-command":
+                params = parse_qs(parsed.query)
+                screen_id = str((params.get("screen_id") or [""])[0]).strip()
+                try:
+                    since = max(0, int(str((params.get("since") or ["0"])[0])))
+                except ValueError:
+                    since = 0
+                try:
+                    timeout_ms = int(str((params.get("timeout_ms") or ["25000"])[0]))
+                except ValueError:
+                    timeout_ms = 25000
+                timeout_seconds = min(max(timeout_ms / 1000.0, 1.0), 30.0)
+                command_response = self.engine.wait_for_local_worker_command(
+                    screen_id,
+                    since,
+                    timeout_seconds,
+                )
+                payload = {"ok": True, **command_response}
+                self._write_json(handler, payload)
+                return
+            self._write_json(
+                handler, {"ok": False, "error": "not_found"}, HTTPStatus.NOT_FOUND
+            )
         except Exception as error:  # noqa: BLE001
-            append_engine_startup_log(f"Engine control GET failure on {parsed.path}: {error}")
-            self._write_json(handler, {"ok": False, "error": str(error)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            append_engine_startup_log(
+                f"Engine control GET failure on {parsed.path}: {error}"
+            )
+            append_engine_diagnostics_event(
+                "engine_control_get_failure",
+                severity="error",
+                details=str(error),
+                context={"path": parsed.path},
+            )
+            self._write_json(
+                handler,
+                {"ok": False, "error": str(error)},
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
     def _handle_post(self, handler: BaseHTTPRequestHandler) -> None:
         parsed = urlparse(handler.path)
         if parsed.path != "/api/action":
-            self._write_json(handler, {"ok": False, "error": "not_found"}, HTTPStatus.NOT_FOUND)
+            self._write_json(
+                handler, {"ok": False, "error": "not_found"}, HTTPStatus.NOT_FOUND
+            )
             return
         request = self._read_json(handler)
         action = str(request.get("action") or "").strip()
@@ -6169,8 +8667,21 @@ class EngineControlServer:
         if not isinstance(payload, dict):
             payload = {}
         try:
-            result = self.engine.run_on_engine_thread(lambda: self.engine.handle_action(action, payload))
+            result = self.engine.run_on_engine_thread(
+                lambda: self.engine.handle_action(action, payload)
+            )
+            append_engine_diagnostics_event(
+                "engine_action_succeeded",
+                details=f"Action {action} applied.",
+                context={"action": action},
+            )
         except Exception as error:  # noqa: BLE001
+            append_engine_diagnostics_event(
+                "engine_action_failed",
+                severity="error",
+                details=str(error),
+                context={"action": action},
+            )
             result = {
                 "ok": False,
                 "error": str(error),
@@ -6188,35 +8699,63 @@ class ControllerEngine(QObject):
         super().__init__()
         self._state_condition = threading.Condition()
         self._state_version = 0
+        self._channel_versions = {name: 0 for name in STATE_CHANNELS}
         self._media_scan_lock = threading.Lock()
         self._media_scan_generation = 0
         self._media_scan_target_dir: Path | None = None
         self._media_scan_active = False
+        self._media_scan_started_monotonic = 0.0
         self.media_scan_in_progress = False
         self.media_scan_error = ""
+        self.last_media_scan_duration_ms = 0
+        self.last_media_scan_file_count = 0
+        self.last_snapshot_size_bytes = 0
+        self.last_snapshot_generated_at = ""
         config = load_config()
-        self.configured_screens = [ConfiguredScreen.from_dict(item.to_dict()) for item in config["configured_screens"]]
+        self.configured_screens = [
+            ConfiguredScreen.from_dict(item.to_dict())
+            for item in config["configured_screens"]
+        ]
         try:
             validate_unique_browser_bindings(self.configured_screens)
-            validate_unique_dlna_bindings(self.configured_screens)
-            validate_unique_miracast_bindings(self.configured_screens)
         except ValueError:
             self.configured_screens = []
-        self.screen_groups = [ScreenGroup.from_dict(item.to_dict()) for item in config["screen_groups"]]
+        self.screen_groups = [
+            ScreenGroup.from_dict(item.to_dict()) for item in config["screen_groups"]
+        ]
         self.schedules = [ScheduleEntry.from_dict(item) for item in config["schedules"]]
-        self.selected_monitor_ids = [str(item) for item in config["selected_monitor_ids"]]
-        self.video_directory: Path | None = Path(config["video_directory"]).expanduser() if config["video_directory"] else None
+        self.selected_monitor_ids = [
+            str(item) for item in config["selected_monitor_ids"]
+        ]
+        self.enabled_screen_ids = [
+            str(item) for item in config.get("enabled_screen_ids") or []
+        ]
+        self.video_directory: Path | None = (
+            Path(config["video_directory"]).expanduser()
+            if config["video_directory"]
+            else None
+        )
         if self.video_directory is not None and not self.video_directory.exists():
             self.video_directory = None
-        self.screen_aliases = {str(key): str(value) for key, value in config["screen_aliases"].items()}
-        self.screen_aliases.update(configured_screen_name_map(self.configured_screens))
+        self.screen_aliases = {
+            str(key): str(value) for key, value in config["screen_aliases"].items()
+        }
+        self.screen_registry = ScreenRegistry(self)
+        self.screen_aliases.update(self.screen_registry.configured_screen_name_map())
         self.transition_method = str(config["transition_method"])
         self.run_at_startup = bool(config["run_at_startup"])
+        self.lan_pairing_required = bool(config.get("lan_pairing_required"))
+        self.lan_allow_unpaired_clients = bool(config.get("lan_allow_unpaired_clients"))
+        self.lan_paired_client_ids = [
+            str(item).strip()
+            for item in (config.get("lan_paired_client_ids") or [])
+            if str(item).strip()
+        ]
         self.available_videos: list[Path] = []
         self.remote_screens: dict[str, dict[str, Any]] = {}
-        self.dlna_devices: dict[str, dict[str, Any]] = {}
-        self.miracast_devices: dict[str, dict[str, Any]] = {}
-        self.status_clock_label, self.status_active_label = current_uk_time_status(self.schedules)
+        self.status_clock_label, self.status_active_label = current_uk_time_status(
+            self.schedules
+        )
         self.local_window_count = 0
         self.local_playback_workers: dict[str, subprocess.Popen] = {}
         self.playback_paused = False
@@ -6232,12 +8771,6 @@ class ControllerEngine(QObject):
         self.remote_refresh_timer = QTimer(self)
         self.remote_refresh_timer.setInterval(1500)
         self.remote_refresh_timer.timeout.connect(self.refresh_remote_screens)
-        self.dlna_refresh_timer = QTimer(self)
-        self.dlna_refresh_timer.setInterval(15000)
-        self.dlna_refresh_timer.timeout.connect(self.refresh_dlna_devices)
-        self.miracast_refresh_timer = QTimer(self)
-        self.miracast_refresh_timer.setInterval(15000)
-        self.miracast_refresh_timer.timeout.connect(self.refresh_miracast_devices)
         self.firewall_check_timer = QTimer(self)
         self.firewall_check_timer.setInterval(60000)
         self.firewall_check_timer.timeout.connect(self.ensure_firewall_access)
@@ -6255,52 +8788,49 @@ class ControllerEngine(QObject):
         self.remote_server = LanRemoteServer()
         self.remote_server.set_change_callback(self.remote_server_changed.emit)
         self.remote_server.set_media_root(self.video_directory)
+        self.remote_server.configure_pairing(
+            self.lan_pairing_required,
+            self.lan_allow_unpaired_clients,
+            self.lan_paired_client_ids,
+        )
+        self.engine_tray_icon: QSystemTrayIcon | None = None
         self.remote_server.start()
-        self.dlna_adapter = DlnaAdapter()
-        self.dlna_adapter.set_change_callback(self.on_dlna_devices_changed)
-        self.miracast_adapter = MiracastAdapter()
-        self.miracast_adapter.set_change_callback(self.on_miracast_devices_changed)
         self.control_server = EngineControlServer(self)
         self.control_server.start()
+        self.setup_engine_tray_icon()
         self.apply_video_directory_watch()
         self.refresh_video_library()
         self.sync_playback_outputs()
         self.refresh_remote_screens()
-        self.refresh_dlna_devices()
-        self.refresh_miracast_devices()
         self.ensure_firewall_access(force_retry=False)
         self.sync_startup_registration()
         self.remote_refresh_timer.start()
-        self.dlna_refresh_timer.start()
-        self.miracast_refresh_timer.start()
         self.firewall_check_timer.start()
 
     def on_status_changed(self, clock_label: str, active_label: str) -> None:
         self.status_clock_label = clock_label
         self.status_active_label = active_label
 
-    def on_dlna_devices_changed(self) -> None:
-        self.refresh_dlna_devices(notify_only=True)
-
-    def on_miracast_devices_changed(self) -> None:
-        self.refresh_miracast_devices(notify_only=True)
-
     def browser_configured_screens(self) -> list[ConfiguredScreen]:
-        return [screen for screen in self.configured_screens if screen.transport == "browser"]
+        registry = getattr(self, "screen_registry", None)
+        if registry is not None:
+            return registry.browser_configured_screens()
+        return [
+            screen
+            for screen in self.configured_screens
+            if screen.transport == "browser"
+        ]
 
     def browser_configured_screen_ids(self) -> set[str]:
+        registry = getattr(self, "screen_registry", None)
+        if registry is not None:
+            return registry.browser_configured_screen_ids()
         return configured_browser_screen_ids(self.configured_screens)
 
-    def dlna_configured_screens(self) -> list[ConfiguredScreen]:
-        return [screen for screen in self.configured_screens if screen.transport == "dlna"]
-
-    def dlna_configured_screen_ids(self) -> set[str]:
-        return {screen.id for screen in self.dlna_configured_screens()}
-
-    def miracast_configured_screens(self) -> list[ConfiguredScreen]:
-        return [screen for screen in self.configured_screens if screen.transport == "miracast"]
-
     def static_media_configured_screen_ids(self) -> set[str]:
+        registry = getattr(self, "screen_registry", None)
+        if registry is not None:
+            return registry.static_media_configured_screen_ids()
         return {
             screen.id
             for screen in self.configured_screens
@@ -6308,12 +8838,19 @@ class ControllerEngine(QObject):
         }
 
     def all_screen_groups(self) -> list[ScreenGroup]:
+        registry = getattr(self, "screen_registry", None)
+        if registry is not None:
+            return registry.all_screen_groups()
         return combined_screen_groups(self.selected_monitor_ids, self.screen_groups)
 
     def on_playback_state_changed(self, paused: bool, window_count: int) -> None:
         self.playback_paused = paused
-        self.local_window_count = len(self.local_playback_workers) if not self.coordinator.manage_local_windows else window_count
-        self.notify_state_changed()
+        self.local_window_count = (
+            len(self.local_playback_workers)
+            if not self.coordinator.manage_local_windows
+            else window_count
+        )
+        self.notify_state_changed("runtime")
 
     def _run_invocation(self, callback) -> None:
         callback()
@@ -6334,12 +8871,24 @@ class ControllerEngine(QObject):
 
         self.invoke_requested.emit(invoke)
         if not completed.wait(10.0):
-            raise TimeoutError("The engine UI thread did not process the request in time.")
+            raise TimeoutError(
+                "The engine UI thread did not process the request in time."
+            )
         if "error" in outcome:
             raise outcome["error"]
         return outcome.get("result")
 
-    def notify_state_changed(self) -> int:
+    def channel_versions_snapshot(self) -> dict[str, int]:
+        return {
+            name: int(self._channel_versions.get(name, 0)) for name in STATE_CHANNELS
+        }
+
+    def notify_state_changed(self, *channels: str) -> int:
+        requested = [name for name in channels if name in STATE_CHANNELS]
+        if not requested:
+            requested = ["runtime"]
+        for name in requested:
+            self._channel_versions[name] = int(self._channel_versions.get(name, 0)) + 1
         with self._state_condition:
             self._state_version += 1
             version = self._state_version
@@ -6358,6 +8907,65 @@ class ControllerEngine(QObject):
                 self._state_condition.wait(remaining)
                 if self._state_version != since:
                     return True, self._state_version
+
+    def local_worker_command_payload(self, screen_id: str) -> dict[str, Any]:
+        command = self.build_remote_server_commands().get(screen_id) or {
+            "protocolVersion": COMMAND_PROTOCOL_VERSION,
+            "screenId": screen_id,
+            "version": 0,
+            "type": "clear",
+            "mode": "idle",
+            "message": "",
+            "label": "",
+            "path": "",
+            "paths": [],
+            "relativePath": "",
+            "relativePaths": [],
+            "mediaKind": "",
+            "mediaUrl": "",
+            "mediaUrls": [],
+            "cycle": False,
+            "cycleIntervalSeconds": 10,
+            "playAtMs": 0,
+            "transition": "fade_black",
+            "paused": False,
+        }
+        return command
+
+    def wait_for_local_worker_command(
+        self, screen_id: str, since_version: int, timeout: float
+    ) -> dict[str, Any]:
+        normalized_screen_id = str(screen_id or "").strip()
+        baseline = max(0, int(since_version))
+        timeout_seconds = max(0.0, float(timeout))
+        deadline = time.monotonic() + timeout_seconds
+        state_since = -1
+
+        while True:
+            command = self.run_on_engine_thread(
+                lambda: self.local_worker_command_payload(normalized_screen_id)
+            )
+            version = max(0, int(command.get("version") or 0))
+            if version != baseline:
+                return {
+                    "updated": True,
+                    "commandVersion": version,
+                    "command": command,
+                }
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return {
+                    "updated": False,
+                    "commandVersion": version,
+                    "command": command,
+                }
+
+            wait_for = min(remaining, 5.0)
+            updated, state_version = self.wait_for_state_update(state_since, wait_for)
+            state_since = state_version
+            if not updated:
+                continue
 
     def should_register_startup(self) -> bool:
         return self.run_at_startup or bool(self.schedules)
@@ -6385,10 +8993,14 @@ class ControllerEngine(QObject):
             self.configured_screens,
             self.screen_groups,
             self.selected_monitor_ids,
+            self.enabled_screen_ids,
             str(self.video_directory) if self.video_directory is not None else "",
             self.screen_aliases,
             self.transition_method,
             self.run_at_startup,
+            self.lan_pairing_required,
+            self.lan_allow_unpaired_clients,
+            self.lan_paired_client_ids,
             self.schedules,
         )
 
@@ -6407,6 +9019,15 @@ class ControllerEngine(QObject):
         self.coordinator.set_video_directory(self.video_directory)
         self.start_media_scan()
 
+    def performance_metrics_payload(self) -> dict[str, Any]:
+        return {
+            "mediaScanDurationMs": int(self.last_media_scan_duration_ms),
+            "indexedFileCount": int(self.last_media_scan_file_count),
+            "snapshotSizeBytes": int(self.last_snapshot_size_bytes),
+            "localPlaybackWorkerCount": len(self.local_playback_workers),
+            "lastSnapshotGeneratedAt": self.last_snapshot_generated_at,
+        }
+
     def start_media_scan(self) -> None:
         directory = self.video_directory
         with self._media_scan_lock:
@@ -6417,18 +9038,21 @@ class ControllerEngine(QObject):
             self.available_videos = []
             self.media_scan_in_progress = False
             self.media_scan_error = ""
+            self.last_media_scan_duration_ms = 0
+            self.last_media_scan_file_count = 0
             self.sync_playback_outputs()
-            self.notify_state_changed()
+            self.notify_state_changed("library", "runtime")
             return
         should_start_worker = False
         with self._media_scan_lock:
             if not self.media_scan_in_progress:
                 self.media_scan_in_progress = True
                 self.media_scan_error = ""
+                self._media_scan_started_monotonic = time.monotonic()
                 should_start_worker = True
             elif not self._media_scan_active:
                 should_start_worker = True
-        self.notify_state_changed()
+        self.notify_state_changed("library", "runtime")
         if should_start_worker:
             self._launch_media_scan_worker(generation, directory)
 
@@ -6451,7 +9075,9 @@ class ControllerEngine(QObject):
             daemon=True,
         ).start()
 
-    def on_media_scan_completed(self, results: object, generation: int, error_message: str) -> None:
+    def on_media_scan_completed(
+        self, results: object, generation: int, error_message: str
+    ) -> None:
         next_generation = 0
         next_directory: Path | None = None
         apply_results = False
@@ -6467,8 +9093,27 @@ class ControllerEngine(QObject):
         if apply_results:
             self.available_videos = list(results) if isinstance(results, list) else []
             self.media_scan_error = error_message
+            self.last_media_scan_file_count = len(self.available_videos)
+            if self._media_scan_started_monotonic > 0:
+                self.last_media_scan_duration_ms = max(
+                    0,
+                    int((time.monotonic() - self._media_scan_started_monotonic) * 1000),
+                )
+            else:
+                self.last_media_scan_duration_ms = 0
+            self._media_scan_started_monotonic = 0.0
+            append_engine_startup_log(
+                "Media scan completed: "
+                f"{self.last_media_scan_file_count} file(s) in "
+                f"{self.last_media_scan_duration_ms} ms"
+                + (
+                    f" (error: {self.media_scan_error})"
+                    if self.media_scan_error
+                    else ""
+                )
+            )
             self.sync_playback_outputs()
-            self.notify_state_changed()
+            self.notify_state_changed("library", "runtime")
             return
         if next_generation > 0 and next_directory is not None:
             self._launch_media_scan_worker(next_generation, next_directory)
@@ -6478,9 +9123,15 @@ class ControllerEngine(QObject):
             screen_id: remote_screen_digest(state)
             for screen_id, state in self.remote_screens.items()
         }
-        self.remote_screens = {item["screen_id"]: item for item in self.remote_server.remote_screens_snapshot()}
+        self.remote_screens = {
+            item["screen_id"]: item
+            for item in self.remote_server.remote_screens_snapshot()
+        }
         for screen_id, state in self.remote_screens.items():
-            if screen_id not in self.screen_aliases and str(state.get("name") or "").strip():
+            if (
+                screen_id not in self.screen_aliases
+                and str(state.get("name") or "").strip()
+            ):
                 self.screen_aliases[screen_id] = str(state.get("name")).strip()
         self.sync_remote_server_commands()
         current_snapshot = {
@@ -6488,46 +9139,37 @@ class ControllerEngine(QObject):
             for screen_id, state in self.remote_screens.items()
         }
         if current_snapshot != previous_snapshot:
-            self.notify_state_changed()
-
-    def refresh_dlna_devices(self, notify_only: bool = False) -> None:
-        previous = json.dumps(self.dlna_devices, sort_keys=True)
-        if not notify_only:
-            self.dlna_adapter.refresh_discovery()
-        self.dlna_devices = {
-            str(item.get("usn")): item
-            for item in self.dlna_adapter.devices_snapshot()
-            if isinstance(item, dict) and item.get("usn")
-        }
-        current = json.dumps(self.dlna_devices, sort_keys=True)
-        if current != previous:
-            self.notify_state_changed()
-
-    def refresh_miracast_devices(self, notify_only: bool = False) -> None:
-        previous = json.dumps(self.miracast_devices, sort_keys=True)
-        if not notify_only:
-            self.miracast_adapter.refresh_discovery()
-        self.miracast_devices = {
-            str(item.get("device_id")): item
-            for item in self.miracast_adapter.devices_snapshot()
-            if isinstance(item, dict) and item.get("device_id")
-        }
-        current = json.dumps(self.miracast_devices, sort_keys=True)
-        if current != previous:
-            self.notify_state_changed()
+            self.notify_state_changed("runtime")
 
     def ensure_firewall_access(self, force_retry: bool = False) -> None:
         before_warning = self.remote_server.network_snapshot().get("warnings") or []
-        before_configured = bool(self.remote_server.network_snapshot().get("firewallConfigured"))
+        before_configured = bool(
+            self.remote_server.network_snapshot().get("firewallConfigured")
+        )
         configured = self.remote_server.ensure_firewall_rule(force_retry=force_retry)
         after_snapshot = self.remote_server.network_snapshot()
         after_warning = after_snapshot.get("warnings") or []
         after_configured = bool(after_snapshot.get("firewallConfigured"))
-        if configured != before_configured or after_warning != before_warning or after_configured != before_configured:
-            self.notify_state_changed()
+        if (
+            configured != before_configured
+            or after_warning != before_warning
+            or after_configured != before_configured
+        ):
+            self.notify_state_changed("runtime")
 
-    def unified_screen_targets(self, include_offline: bool = True) -> list[UnifiedScreenTarget]:
+    def unified_screen_targets(
+        self, include_offline: bool = True
+    ) -> list[UnifiedScreenTarget]:
+        registry = getattr(self, "screen_registry", None)
+        if registry is not None:
+            return registry.unified_screen_targets(
+                local_screens=available_screens(),
+                screen_identifier=screen_identifier,
+                screen_display_name=screen_display_name,
+                include_offline=include_offline,
+            )
         targets: list[UnifiedScreenTarget] = []
+        static_media_ids = self.static_media_configured_screen_ids()
         for screen in available_screens():
             identifier = screen_identifier(screen)
             geometry = screen.geometry()
@@ -6540,26 +9182,14 @@ class ControllerEngine(QObject):
                     detail=f"HDMI / local display • {geometry.width()}x{geometry.height()}",
                 )
             )
-        for screen in sorted(self.browser_configured_screens(), key=lambda item: item.name.lower()):
+        for screen in sorted(
+            self.browser_configured_screens(), key=lambda item: item.name.lower()
+        ):
             if screen.id not in static_media_ids:
                 continue
-            online, detail, warning = browser_target_status_detail(screen, self.remote_screens)
-            if not include_offline and not online:
-                continue
-            targets.append(
-                UnifiedScreenTarget(
-                    id=screen.id,
-                    label=screen.name,
-                    kind="remote",
-                    online=online,
-                    detail=detail,
-                    warning=warning,
-                )
+            online, detail, warning = browser_target_status_detail(
+                screen, self.remote_screens
             )
-        for screen in sorted(self.dlna_configured_screens(), key=lambda item: item.name.lower()):
-            if screen.id not in static_media_ids:
-                continue
-            online, detail, warning = dlna_target_status_detail(screen, self.dlna_devices)
             if not include_offline and not online:
                 continue
             targets.append(
@@ -6579,15 +9209,47 @@ class ControllerEngine(QObject):
         command_snapshots = self.coordinator.command_snapshots()
         prepared_commands: dict[str, dict[str, Any]] = {}
         for screen_id, command in command_snapshots.items():
-            media_path = Path(str(command.get("path") or "")) if command.get("path") else None
+            media_path = (
+                Path(str(command.get("path") or "")) if command.get("path") else None
+            )
             media_url = ""
             if media_path is not None:
                 relative_path = str(command.get("relative_path") or "")
-                if relative_path and self.video_directory is not None and media_path.exists():
+                if (
+                    relative_path
+                    and self.video_directory is not None
+                    and media_path.exists()
+                ):
                     media_url = f"/media/{quote(relative_path, safe='/')}"
                 elif media_path.exists():
                     media_url = f"/api/media-file?path={quote(str(media_path))}"
+            cycle_paths = [
+                Path(str(item)) for item in command.get("paths") or [] if str(item)
+            ]
+            cycle_relative_paths = [
+                str(item) for item in command.get("relative_paths") or []
+            ]
+            cycle_media_urls: list[str] = []
+            for index, cycle_path in enumerate(cycle_paths):
+                relative_value = (
+                    cycle_relative_paths[index]
+                    if index < len(cycle_relative_paths)
+                    else ""
+                )
+                if (
+                    relative_value
+                    and self.video_directory is not None
+                    and cycle_path.exists()
+                ):
+                    cycle_media_urls.append(f"/media/{quote(relative_value, safe='/')}")
+                elif cycle_path.exists():
+                    cycle_media_urls.append(
+                        f"/api/media-file?path={quote(str(cycle_path))}"
+                    )
             prepared_commands[screen_id] = {
+                "protocolVersion": int(
+                    command.get("protocol_version") or COMMAND_PROTOCOL_VERSION
+                ),
                 "screenId": screen_id,
                 "version": int(command.get("version") or 0),
                 "type": str(command.get("type") or "clear"),
@@ -6596,14 +9258,25 @@ class ControllerEngine(QObject):
                 "message": str(command.get("message") or ""),
                 "label": str(command.get("label") or ""),
                 "path": str(command.get("path") or ""),
+                "paths": [str(item) for item in cycle_paths],
                 "relativePath": str(command.get("relative_path") or ""),
+                "relativePaths": cycle_relative_paths,
                 "mediaKind": str(command.get("media_kind") or ""),
                 "mediaUrl": media_url,
+                "mediaUrls": cycle_media_urls,
+                "cycle": bool(command.get("cycle")),
+                "cycleIntervalSeconds": int(
+                    command.get("cycle_interval_seconds") or 10
+                ),
                 "playAtMs": int(command.get("play_at_ms") or 0),
                 "transition": str(command.get("transition") or "fade_black"),
                 "paused": bool(command.get("paused")),
             }
-        commands.update(resolve_browser_commands(self.configured_screens, self.remote_screens, prepared_commands))
+        commands.update(
+            resolve_browser_commands(
+                self.configured_screens, self.remote_screens, prepared_commands
+            )
+        )
         for screen_id, command in prepared_commands.items():
             if screen_id in self.browser_configured_screen_ids():
                 continue
@@ -6621,22 +9294,8 @@ class ControllerEngine(QObject):
             if (
                 not is_remote_screen_id(screen_id)
                 and screen_id not in self.browser_configured_screen_ids()
-                and screen_id not in self.dlna_configured_screen_ids()
             )
         )
-
-    def absolute_controller_media_url(self, media_url: str) -> str:
-        if not media_url:
-            return ""
-        if media_url.startswith("http://") or media_url.startswith("https://"):
-            return media_url
-        snapshot = self.remote_server.network_snapshot()
-        preferred_ip = str(snapshot.get("preferred_ip") or "").strip()
-        hostname = str(snapshot.get("hostname") or "").strip()
-        host = preferred_ip or hostname
-        if not host:
-            return ""
-        return f"http://{host}:{LAN_SERVER_PORT}{media_url}"
 
     def spawn_local_playback_worker(self, screen_id: str) -> None:
         if screen_id in self.local_playback_workers:
@@ -6651,15 +9310,23 @@ class ControllerEngine(QObject):
                 **windows_hidden_subprocess_kwargs(),
             )
         except OSError as error:
-            append_engine_startup_log(f"Failed to launch local playback worker for {screen_id}: {error}")
+            append_engine_startup_log(
+                f"Failed to launch local playback worker for {screen_id}: {error}"
+            )
             return
         self.local_playback_workers[screen_id] = process
+        append_engine_startup_log(
+            f"Local playback worker started for {screen_id}; worker_count={len(self.local_playback_workers)}"
+        )
 
     def stop_local_playback_worker(self, screen_id: str) -> None:
         process = self.local_playback_workers.pop(screen_id, None)
         if process is None:
             return
         if process.poll() is not None:
+            append_engine_startup_log(
+                f"Local playback worker removed for {screen_id}; worker_count={len(self.local_playback_workers)}"
+            )
             return
         try:
             if sys.platform == "win32":
@@ -6674,6 +9341,9 @@ class ControllerEngine(QObject):
                 process.terminate()
         except OSError:
             pass
+        append_engine_startup_log(
+            f"Local playback worker stopped for {screen_id}; worker_count={len(self.local_playback_workers)}"
+        )
 
     def sync_local_playback_workers(self) -> None:
         desired_ids = set(self.desired_local_worker_screen_ids())
@@ -6692,24 +9362,14 @@ class ControllerEngine(QObject):
         prepared_commands = self.build_remote_server_commands()
         self.remote_server.set_media_root(self.video_directory)
         self.remote_server.set_commands(prepared_commands)
-        dlna_commands = resolve_dlna_commands(self.configured_screens, self.dlna_devices, prepared_commands)
-        for command in dlna_commands.values():
-            command["mediaUrl"] = self.absolute_controller_media_url(str(command.get("mediaUrl") or ""))
-        self.dlna_adapter.apply_commands(dlna_commands)
         self.sync_local_playback_workers()
-        self.notify_state_changed()
+        self.notify_state_changed("runtime")
 
     def available_media_payload(self) -> list[dict[str, Any]]:
-        return [
-            {
-                "relativePath": media_relative_path(path, self.video_directory),
-                "name": path.name,
-                "category": media_category_label(path, self.video_directory),
-                "isVideo": is_video_file(path),
-                "isImage": is_image_file(path),
-            }
-            for path in self.available_videos
-        ]
+        return build_media_library_index_from_paths(
+            self.video_directory,
+            [path for path in self.available_videos if path.exists()],
+        ).payload()
 
     def current_status_payload(self) -> dict[str, Any]:
         now = current_uk_datetime()
@@ -6719,11 +9379,23 @@ class ControllerEngine(QObject):
             (
                 entry
                 for screen_id in self.selected_monitor_ids
-                if (entry := active_schedule_for_screen(self.schedules, weekday_index, minute_of_day, screen_id, self.all_screen_groups())) is not None
+                if (
+                    entry := active_schedule_for_screen(
+                        self.schedules,
+                        weekday_index,
+                        minute_of_day,
+                        screen_id,
+                        self.all_screen_groups(),
+                    )
+                )
+                is not None
             ),
             active_schedule_for_minute(self.schedules, weekday_index, minute_of_day),
         )
-        if not self.coordinator.playback_enabled and not self.coordinator.quick_play_paths:
+        if (
+            not self.coordinator.playback_enabled
+            and not self.coordinator.quick_play_paths
+        ):
             return {
                 "clockLabel": self.status_clock_label,
                 "activeLabel": "Playback stopped",
@@ -6747,54 +9419,112 @@ class ControllerEngine(QObject):
             "heroProgress": schedule_progress(active_entry, now),
         }
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot_for_channels(
+        self, client_channel_versions: dict[str, int] | None
+    ) -> dict[str, Any]:
+        current_versions = self.channel_versions_snapshot()
+        requested_versions = client_channel_versions or {}
+        changed_channels = {
+            name
+            for name in STATE_CHANNELS
+            if int(requested_versions.get(name) or 0)
+            < int(current_versions.get(name) or 0)
+        }
+        if not client_channel_versions:
+            changed_channels = set(STATE_CHANNELS)
+
         remote_active = sum(
             1
             for state in self.remote_screens.values()
-            if state.get("online") and str(state.get("state") or "") in {"playing", "connected"} and str(state.get("current_media") or "")
+            if state.get("online")
+            and str(state.get("state") or "") in {"playing", "connected"}
+            and str(state.get("current_media") or "")
         )
-        return {
+        snapshot: dict[str, Any] = {
             "stateVersion": self._state_version,
-            "configuredScreens": [screen.to_dict() for screen in self.configured_screens],
-            "screenGroups": [group.to_dict() for group in self.screen_groups],
-            "selectedMonitorIds": self.selected_monitor_ids,
-            "videoDirectory": str(self.video_directory) if self.video_directory is not None else "",
-            "screenAliases": self.screen_aliases,
-            "transitionMethod": self.transition_method,
-            "runAtStartup": self.run_at_startup,
-            "schedules": [entry.to_dict() for entry in self.schedules],
-            "availableMedia": self.available_media_payload(),
-            "library": {
-                "scanning": self.media_scan_in_progress,
-                "error": self.media_scan_error,
-                "indexedCount": len(self.available_videos),
-            },
-            "remoteScreens": self.remote_server.remote_screens_snapshot(),
-            "dlnaDevices": self.dlna_adapter.devices_snapshot(),
-            "miracastDevices": self.miracast_adapter.devices_snapshot(),
-            "network": self.remote_server.network_snapshot(),
-            "screens": [
-                {
-                    "id": target.id,
-                    "label": target.label,
-                    "kind": target.kind,
-                    "online": target.online,
-                    "detail": target.detail,
-                    "warning": target.warning,
-                }
-                for target in self.unified_screen_targets(include_offline=True)
-            ],
-            "status": self.current_status_payload(),
-            "playback": {
-                "enabled": self.coordinator.playback_enabled,
-                "paused": self.playback_paused,
-                "localWindowCount": self.local_window_count,
-                "remoteActiveCount": remote_active,
-                "activeScreenCount": self.local_window_count + remote_active,
-            },
+            "channelVersions": current_versions,
+            "channels": sorted(changed_channels),
         }
 
+        if "config" in changed_channels:
+            snapshot.update(
+                {
+                    "configuredScreens": [
+                        screen.to_dict() for screen in self.configured_screens
+                    ],
+                    "screenGroups": [group.to_dict() for group in self.screen_groups],
+                    "selectedMonitorIds": self.selected_monitor_ids,
+                    "enabledScreenIds": self.enabled_screen_ids,
+                    "videoDirectory": str(self.video_directory)
+                    if self.video_directory is not None
+                    else "",
+                    "screenAliases": self.screen_aliases,
+                    "transitionMethod": self.transition_method,
+                    "runAtStartup": self.run_at_startup,
+                    "lanPairingRequired": self.lan_pairing_required,
+                    "lanAllowUnpairedClients": self.lan_allow_unpaired_clients,
+                    "lanPairedClientIds": self.lan_paired_client_ids,
+                    "schedules": [entry.to_dict() for entry in self.schedules],
+                }
+            )
+
+        if "library" in changed_channels:
+            snapshot.update(
+                {
+                    "availableMedia": self.available_media_payload(),
+                    "library": {
+                        "scanning": self.media_scan_in_progress,
+                        "error": self.media_scan_error,
+                        "indexedCount": len(self.available_videos),
+                    },
+                }
+            )
+
+        if "runtime" in changed_channels:
+            snapshot.update(
+                {
+                    "remoteScreens": self.remote_server.remote_screens_snapshot(),
+                    "network": self.remote_server.network_snapshot(),
+                    "screens": [
+                        {
+                            "id": target.id,
+                            "label": target.label,
+                            "kind": target.kind,
+                            "online": target.online,
+                            "detail": target.detail,
+                            "warning": target.warning,
+                        }
+                        for target in self.unified_screen_targets(include_offline=True)
+                    ],
+                    "status": self.current_status_payload(),
+                    "playback": {
+                        "enabled": self.coordinator.playback_enabled,
+                        "paused": self.playback_paused,
+                        "localWindowCount": self.local_window_count,
+                        "remoteActiveCount": remote_active,
+                        "activeScreenCount": self.local_window_count + remote_active,
+                    },
+                }
+            )
+
+        snapshot["performance"] = self.performance_metrics_payload()
+        self.last_snapshot_generated_at = datetime.now().isoformat(timespec="seconds")
+        snapshot["performance"] = self.performance_metrics_payload()
+        try:
+            self.last_snapshot_size_bytes = len(
+                json.dumps(snapshot, separators=(",", ":")).encode("utf-8")
+            )
+        except Exception:
+            self.last_snapshot_size_bytes = 0
+        snapshot["performance"] = self.performance_metrics_payload()
+        return snapshot
+
+    def snapshot(self) -> dict[str, Any]:
+        return self.snapshot_for_channels(None)
+
     def handle_action(self, action: str, payload: dict[str, Any]) -> dict[str, Any]:
+        extra: dict[str, Any] = {}
+        changed_channels: set[str] = {"runtime"}
         if action == "toggle_screen_selection":
             screen_id = str(payload.get("screen_id") or "")
             if screen_id:
@@ -6805,6 +9535,16 @@ class ControllerEngine(QObject):
                 self.coordinator.set_selected_monitors(self.selected_monitor_ids)
                 self.coordinator.set_screen_groups(self.all_screen_groups())
                 self.persist_state()
+                changed_channels.add("config")
+        elif action == "set_selected_screens":
+            raw_ids = payload.get("screen_ids") or []
+            self.selected_monitor_ids = [
+                str(item) for item in raw_ids if isinstance(item, str)
+            ]
+            self.coordinator.set_selected_monitors(self.selected_monitor_ids)
+            self.coordinator.set_screen_groups(self.all_screen_groups())
+            self.persist_state()
+            changed_channels.add("config")
         elif action == "rename_screen_alias":
             screen_id = str(payload.get("screen_id") or "")
             alias = str(payload.get("alias") or "").strip()
@@ -6813,6 +9553,57 @@ class ControllerEngine(QObject):
             else:
                 self.screen_aliases.pop(screen_id, None)
             self.persist_state()
+            changed_channels.add("config")
+        elif action == "set_enabled_screens":
+            raw_ids = payload.get("screen_ids") or []
+            self.enabled_screen_ids = [
+                str(item) for item in raw_ids if isinstance(item, str)
+            ]
+            self.persist_state()
+            changed_channels.add("config")
+        elif action == "purge_remembered_screens":
+            include_online = bool(payload.get("include_online"))
+            removed_ids = self.remote_server.purge_remote_screens(
+                include_online=include_online
+            )
+            if removed_ids:
+                removed_set = set(removed_ids)
+                self.selected_monitor_ids = [
+                    item
+                    for item in self.selected_monitor_ids
+                    if item not in removed_set
+                ]
+                for entry in self.schedules:
+                    filtered_targets = [
+                        target_id
+                        for target_id in entry.screen_ids
+                        if target_id not in removed_set
+                    ]
+                    entry.screen_ids = normalize_schedule_target_ids(
+                        filtered_targets
+                    ) or [DEFAULT_GROUP_ID]
+                    entry.media_assignments = {
+                        screen_id: assignment
+                        for screen_id, assignment in entry.media_assignments.items()
+                        if screen_id not in removed_set
+                    }
+                for group in self.screen_groups:
+                    group.screen_ids = [
+                        screen_id
+                        for screen_id in group.screen_ids
+                        if screen_id not in removed_set
+                    ]
+                self.enabled_screen_ids = [
+                    item for item in self.enabled_screen_ids if item not in removed_set
+                ]
+                for screen_id in removed_ids:
+                    self.screen_aliases.pop(screen_id, None)
+                self.coordinator.set_selected_monitors(self.selected_monitor_ids)
+                self.coordinator.set_screen_groups(self.all_screen_groups())
+                self.coordinator.set_schedules(self.schedules)
+                self.persist_state()
+                changed_channels.add("config")
+            extra["removed"] = len(removed_ids)
         elif action == "set_transition_method":
             transition_method = str(payload.get("transition_method") or "")
             if transition_method in TRANSITION_METHODS:
@@ -6820,6 +9611,7 @@ class ControllerEngine(QObject):
                 self.coordinator.set_transition_method(self.transition_method)
                 self.sync_playback_outputs()
                 self.persist_state()
+                changed_channels.add("config")
         elif action == "quick_play":
             path = Path(str(payload.get("path") or "")).expanduser()
             target_ids = [str(item) for item in payload.get("target_screen_ids") or []]
@@ -6837,13 +9629,17 @@ class ControllerEngine(QObject):
             self.video_directory = Path(selected).expanduser()
             self.refresh_video_library()
             self.persist_state()
+            changed_channels.update({"config", "library"})
         elif action == "refresh_media":
             self.refresh_video_library()
+            changed_channels.add("library")
         elif action == "launch_selected":
             self.coordinator.set_schedules(self.schedules)
             self.coordinator.set_selected_monitors(self.selected_monitor_ids)
             if not self.coordinator.has_launch_targets():
-                raise ValueError("Choose at least one screen in the default playback group or target a screen/group within a schedule before launching playback.")
+                raise ValueError(
+                    "Choose at least one screen in the default playback group or target a screen/group within a schedule before launching playback."
+                )
             self.coordinator.launch_windows()
             self.sync_playback_outputs()
         elif action == "toggle_pause":
@@ -6853,37 +9649,137 @@ class ControllerEngine(QObject):
             self.sync_playback_outputs()
         elif action == "retry_firewall_setup":
             self.ensure_firewall_access(force_retry=True)
-        elif action == "refresh_dlna_discovery":
-            self.refresh_dlna_devices()
-        elif action == "refresh_miracast_discovery":
-            self.refresh_miracast_devices()
+        elif action == "export_diagnostics":
+            requested_path = str(payload.get("path") or "").strip()
+            destination = Path(requested_path).expanduser() if requested_path else None
+            exported = export_engine_diagnostics_bundle(
+                destination=destination,
+                snapshot=self.snapshot_for_channels(None),
+            )
+            extra["exportPath"] = str(exported)
         elif action == "set_run_at_startup":
             self.run_at_startup = bool(payload.get("value"))
             self.sync_startup_registration()
             self.persist_state()
+            changed_channels.add("config")
         elif action == "set_configured_screens":
-            self.configured_screens = validate_configured_screens(payload.get("configured_screens"))
+            self.configured_screens = validate_configured_screens(
+                payload.get("configured_screens")
+            )
             validate_unique_browser_bindings(self.configured_screens)
-            validate_unique_dlna_bindings(self.configured_screens)
-            validate_unique_miracast_bindings(self.configured_screens)
-            self.screen_aliases.update(configured_screen_name_map(self.configured_screens))
-            self.coordinator.set_virtual_screen_ids(self.browser_configured_screen_ids())
+            self.screen_aliases.update(
+                configured_screen_name_map(self.configured_screens)
+            )
+            self.coordinator.set_virtual_screen_ids(
+                self.browser_configured_screen_ids()
+            )
             self.persist_state()
+            changed_channels.add("config")
+        elif action == "merge_duplicate_screen":
+            source_id = str(payload.get("source_screen_id") or "").strip()
+            target_id = str(payload.get("target_screen_id") or "").strip()
+            if not source_id or not target_id:
+                raise ValueError("Provide both source and target screen ids.")
+            if source_id == target_id:
+                raise ValueError("Source and target screen ids must be different.")
+            if not source_id.startswith("remote:") or not target_id.startswith(
+                "remote:"
+            ):
+                raise ValueError("Only remembered remote screens can be merged.")
+
+            merged = self.remote_server.merge_remote_screens(source_id, target_id)
+            if not merged:
+                raise ValueError("Unable to merge screens. Verify both ids exist.")
+
+            def remap_ids(values: list[str]) -> list[str]:
+                remapped: list[str] = []
+                for value in values:
+                    remapped.append(target_id if value == source_id else value)
+                return remapped
+
+            self.selected_monitor_ids = list(
+                dict.fromkeys(remap_ids(self.selected_monitor_ids))
+            )
+            self.enabled_screen_ids = list(
+                dict.fromkeys(remap_ids(self.enabled_screen_ids))
+            )
+
+            for entry in self.schedules:
+                entry.screen_ids = normalize_schedule_target_ids(
+                    remap_ids(entry.screen_ids)
+                ) or [DEFAULT_GROUP_ID]
+                if source_id in entry.media_assignments:
+                    if target_id not in entry.media_assignments:
+                        assignment = entry.media_assignments[source_id]
+                        assignment.screen_id = target_id
+                        entry.media_assignments[target_id] = assignment
+                    entry.media_assignments.pop(source_id, None)
+
+            for group in self.screen_groups:
+                group.screen_ids = list(dict.fromkeys(remap_ids(group.screen_ids)))
+
+            source_alias = self.screen_aliases.get(source_id, "")
+            target_alias = self.screen_aliases.get(target_id, "")
+            if source_alias and not target_alias:
+                self.screen_aliases[target_id] = source_alias
+            self.screen_aliases.pop(source_id, None)
+
+            remapped_configured: list[ConfiguredScreen] = []
+            seen_configured_ids: set[str] = set()
+            for screen in self.configured_screens:
+                if screen.id == source_id:
+                    replacement = ConfiguredScreen(
+                        id=target_id,
+                        name=screen.name,
+                        transport=screen.transport,
+                        capabilities=screen.capabilities[:],
+                        binding=dict(screen.binding),
+                    )
+                else:
+                    replacement = screen
+                if replacement.id in seen_configured_ids:
+                    continue
+                seen_configured_ids.add(replacement.id)
+                remapped_configured.append(replacement)
+            self.configured_screens = remapped_configured
+
+            self.coordinator.set_selected_monitors(self.selected_monitor_ids)
+            self.coordinator.set_screen_groups(self.all_screen_groups())
+            self.coordinator.set_schedules(self.schedules)
+            self.coordinator.set_virtual_screen_ids(
+                self.browser_configured_screen_ids()
+            )
+            self.persist_state()
+            changed_channels.add("config")
+            extra["merged"] = True
         elif action == "set_screen_groups":
             self.screen_groups = validate_screen_groups(payload.get("screen_groups"))
             self.coordinator.set_screen_groups(self.all_screen_groups())
             self.persist_state()
+            changed_channels.add("config")
         elif action == "save_schedule":
+            changed_channels.add("config")
             raw_schedule = payload.get("schedule")
             if not isinstance(raw_schedule, dict):
                 raise ValueError("Invalid schedule payload.")
             candidate = ScheduleEntry.from_dict(raw_schedule)
             if self.video_directory is None:
                 raise ValueError("Set the media folder first from the Library menu.")
-            candidate_path = self.video_directory / candidate.video_file if candidate.video_file else None
+            candidate_path = (
+                self.video_directory / candidate.video_file
+                if candidate.video_file
+                else None
+            )
             if candidate_path is None or not candidate_path.exists():
                 raise ValueError("Choose a media file from the selected folder.")
-            validate_schedule_candidate(candidate, self.schedules, candidate.id if any(item.id == candidate.id for item in self.schedules) else None)
+            validate_schedule_candidate(
+                candidate,
+                self.schedules,
+                candidate.id
+                if any(item.id == candidate.id for item in self.schedules)
+                else None,
+                self.video_directory,
+            )
             replaced = False
             for index, entry in enumerate(self.schedules):
                 if entry.id == candidate.id:
@@ -6892,11 +9788,14 @@ class ControllerEngine(QObject):
                     break
             if not replaced:
                 self.schedules.append(candidate)
-            self.schedules.sort(key=lambda item: ScheduleEntry.time_to_minutes(item.start_time))
+            self.schedules.sort(
+                key=lambda item: ScheduleEntry.time_to_minutes(item.start_time)
+            )
             self.persist_state()
             self.sync_startup_registration()
             self.coordinator.set_schedules(self.schedules)
         elif action == "delete_schedule":
+            changed_channels.add("config")
             schedule_id = str(payload.get("schedule_id") or "")
             self.schedules = [item for item in self.schedules if item.id != schedule_id]
             self.persist_state()
@@ -6906,20 +9805,65 @@ class ControllerEngine(QObject):
             QTimer.singleShot(0, self.shutdown)
         else:
             raise ValueError(f"Unsupported action: {action}")
-        self.notify_state_changed()
-        return {"ok": True, "snapshot": self.snapshot()}
+        self.notify_state_changed(*sorted(changed_channels))
+        return {"ok": True, "snapshot": self.snapshot_for_channels(None), **extra}
+
+    def setup_engine_tray_icon(self) -> None:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self.engine_tray_icon = None
+            return
+        self.engine_tray_icon = QSystemTrayIcon(
+            QApplication.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+        )
+        tray_menu = QMenu()
+        open_controller_action = tray_menu.addAction("Open Controller")
+        open_controller_action.triggered.connect(self.launch_controller_window)
+        tray_menu.addSeparator()
+        stop_action = tray_menu.addAction("Stop Engine")
+        stop_action.triggered.connect(self.shutdown)
+        tray_menu.addSeparator()
+        exit_action = tray_menu.addAction("Exit Engine App")
+        exit_action.triggered.connect(
+            lambda *_args: (
+                QApplication.instance().quit()
+                if QApplication.instance() is not None
+                else None
+            )
+        )
+        self.engine_tray_icon.setContextMenu(tray_menu)
+        self.engine_tray_icon.activated.connect(
+            lambda reason: (
+                self.launch_controller_window()
+                if reason == QSystemTrayIcon.ActivationReason.Trigger
+                else None
+            )
+        )
+        self.engine_tray_icon.setToolTip("Background Screen Engine")
+        self.engine_tray_icon.show()
+
+    def launch_controller_window(self) -> None:
+        try:
+            subprocess.Popen(
+                controller_launch_args(),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                **windows_hidden_subprocess_kwargs(),
+            )
+        except OSError as error:
+            append_engine_startup_log(f"Failed to launch controller window: {error}")
 
     def shutdown(self) -> None:
         self.folder_refresh_timer.stop()
         self.remote_refresh_timer.stop()
-        self.dlna_refresh_timer.stop()
-        self.miracast_refresh_timer.stop()
         self.firewall_check_timer.stop()
         watched_paths = self.folder_watcher.directories()
         if watched_paths:
             self.folder_watcher.removePaths(watched_paths)
         self.control_server.stop()
         self.remote_server.stop()
+        if self.engine_tray_icon is not None:
+            self.engine_tray_icon.hide()
+            self.engine_tray_icon = None
         for screen_id in list(self.local_playback_workers):
             self.stop_local_playback_worker(screen_id)
         self.coordinator.stop_windows()
@@ -6936,7 +9880,9 @@ def run_playback_worker(screen_id: str) -> int:
     try:
         _worker = LocalPlaybackWorkerController(screen_id)
     except Exception as error:  # noqa: BLE001
-        append_engine_startup_log(f"Local playback worker failed for {screen_id}: {error}")
+        append_engine_startup_log(
+            f"Local playback worker failed for {screen_id}: {error}"
+        )
         return 1
     return app.exec()
 
@@ -6945,7 +9891,9 @@ def ensure_backend_running(client: ControllerApiClient) -> None:
     if client.ping():
         return
     remove_stale_engine_lock()
-    existing_engine_pids = [pid for pid in known_engine_process_ids() if is_process_running(pid)]
+    existing_engine_pids = [
+        pid for pid in known_engine_process_ids() if is_process_running(pid)
+    ]
     if existing_engine_pids:
         status = read_engine_startup_status()
         status_message = str(status.get("message") or "").strip()
@@ -6953,9 +9901,13 @@ def ensure_backend_running(client: ControllerApiClient) -> None:
         if client.ping():
             return
         if status_message:
-            append_engine_startup_log(f"Restarting unresponsive engine instance(s): {existing_engine_pids}. Last status: {status_message}")
+            append_engine_startup_log(
+                f"Restarting unresponsive engine instance(s): {existing_engine_pids}. Last status: {status_message}"
+            )
         else:
-            append_engine_startup_log(f"Restarting unresponsive engine instance(s): {existing_engine_pids}")
+            append_engine_startup_log(
+                f"Restarting unresponsive engine instance(s): {existing_engine_pids}"
+            )
     reset_engine_startup_artifacts()
     creationflags = 0
     if sys.platform == "win32":
@@ -6980,16 +9932,31 @@ def ensure_backend_running(client: ControllerApiClient) -> None:
         status = read_engine_startup_status()
         status_message = str(status.get("message") or "").strip()
         status_details = str(status.get("details") or "").strip()
-        status_pid = int(status.get("pid") or 0) if str(status.get("pid") or "").strip() else 0
+        status_pid = (
+            int(status.get("pid") or 0) if str(status.get("pid") or "").strip() else 0
+        )
         if str(status.get("state") or "").strip().lower() == "failed":
-            detail_suffix = f" See {ENGINE_STARTUP_LOG_PATH} for details." if ENGINE_STARTUP_LOG_PATH.exists() else ""
-            raise RuntimeError(status_message or f"The background engine failed during startup.{detail_suffix}")
+            detail_suffix = (
+                f" See {ENGINE_STARTUP_LOG_PATH} for details."
+                if ENGINE_STARTUP_LOG_PATH.exists()
+                else ""
+            )
+            raise RuntimeError(
+                status_message
+                or f"The background engine failed during startup.{detail_suffix}"
+            )
         if status_pid > 0 and not is_process_running(status_pid):
             if status_message:
                 extra = f"\n\n{status_details}" if status_details else ""
                 raise RuntimeError(f"{status_message}{extra}")
-            log_suffix = f" See {ENGINE_STARTUP_LOG_PATH} for details." if ENGINE_STARTUP_LOG_PATH.exists() else ""
-            raise RuntimeError(f"The background engine exited during startup.{log_suffix}")
+            log_suffix = (
+                f" See {ENGINE_STARTUP_LOG_PATH} for details."
+                if ENGINE_STARTUP_LOG_PATH.exists()
+                else ""
+            )
+            raise RuntimeError(
+                f"The background engine exited during startup.{log_suffix}"
+            )
         time.sleep(0.25)
     status = read_engine_startup_status()
     status_message = str(status.get("message") or "").strip()
@@ -7004,10 +9971,16 @@ def ensure_backend_running(client: ControllerApiClient) -> None:
 def run_engine() -> int:
     ensure_app_paths()
     enable_engine_fault_logging()
-    decode_mode = "software-forced" if os.getenv("QT_FFMPEG_DECODING_HW_DEVICE_TYPES", "").strip() == "," else "qt-default"
+    decode_mode = (
+        "software-forced"
+        if os.getenv("QT_FFMPEG_DECODING_HW_DEVICE_TYPES", "").strip() == ","
+        else "qt-default"
+    )
     append_engine_startup_log(f"Engine launch decode mode: {decode_mode}")
     cleanup_legacy_startup_script()
-    write_engine_startup_status("starting", "Launching background engine.", pid=os.getpid())
+    write_engine_startup_status(
+        "starting", "Launching background engine.", pid=os.getpid()
+    )
     engine_lock = acquire_engine_instance_lock()
     if engine_lock is None:
         existing_pid = read_engine_lock_pid()
@@ -7019,7 +9992,11 @@ def run_engine() -> int:
             )
             return 0
         stale_lock_removed = remove_stale_engine_lock()
-        message = "A stale engine lock blocked startup." if stale_lock_removed else "Unable to acquire the engine instance lock."
+        message = (
+            "A stale engine lock blocked startup."
+            if stale_lock_removed
+            else "Unable to acquire the engine instance lock."
+        )
         write_engine_startup_status("failed", message, pid=os.getpid())
         append_engine_startup_log(message)
         raise RuntimeError(message)
@@ -7028,11 +10005,15 @@ def run_engine() -> int:
         app.setApplicationName(f"{APP_NAME} Engine")
         app.setQuitOnLastWindowClosed(False)
         _engine = ControllerEngine()
-        write_engine_startup_status("ready", "Background engine ready.", pid=os.getpid())
+        write_engine_startup_status(
+            "ready", "Background engine ready.", pid=os.getpid()
+        )
         return app.exec()
     except Exception as error:  # noqa: BLE001
         details = traceback.format_exc()
-        write_engine_startup_status("failed", str(error) or "Engine startup failed.", details, pid=os.getpid())
+        write_engine_startup_status(
+            "failed", str(error) or "Engine startup failed.", details, pid=os.getpid()
+        )
         append_engine_startup_log(details)
         raise
     finally:

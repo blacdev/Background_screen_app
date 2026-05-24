@@ -25,8 +25,6 @@ from screen_protocols import (
         ("Local HDMI", "local_hdmi"),
         ("browser_receiver", "browser"),
         ("web", "browser"),
-        ("dlna", "dlna"),
-        ("miracast", "miracast"),
         ("unknown", ""),
     ],
 )
@@ -52,10 +50,9 @@ def test_normalize_capability(raw_value: str, expected: str) -> None:
 
 def test_supported_capabilities_follow_declared_order() -> None:
     assert supported_capabilities("local_hdmi") == ("static_media", "playlist", "live_view", "sync_playback")
-    assert supported_capabilities("miracast") == ("live_view",)
     assert supported_capabilities("invalid") == ()
     assert set(SCREEN_CAPABILITIES) >= set(supported_capabilities("browser"))
-    assert set(SCREEN_TRANSPORTS) == {"local_hdmi", "browser", "dlna", "miracast"}
+    assert set(SCREEN_TRANSPORTS) == {"local_hdmi", "browser"}
 
 
 def test_normalized_capabilities_deduplicates_and_filters_unknown_values() -> None:
@@ -67,10 +64,7 @@ def test_normalized_capabilities_deduplicates_and_filters_unknown_values() -> No
 
 
 def test_unsupported_capabilities_reports_only_invalid_items_for_transport() -> None:
-    assert unsupported_capabilities("dlna", ["static_media", "live_view", "sync_playback"]) == [
-        "live_view",
-        "sync_playback",
-    ]
+    assert unsupported_capabilities("browser", ["static_media", "live_view", "sync_playback"]) == []
 
 
 def test_configured_screen_round_trips_and_defaults_capabilities() -> None:
@@ -95,7 +89,7 @@ def test_configured_screen_round_trips_and_defaults_capabilities() -> None:
 
 def test_configured_screen_validation_rejects_missing_name() -> None:
     with pytest.raises(ValueError, match="must have a name"):
-        ConfiguredScreen.from_dict({"id": "screen-2", "transport": "dlna", "capabilities": ["static_media"]})
+        ConfiguredScreen.from_dict({"id": "screen-2", "transport": "browser", "capabilities": ["static_media"]})
 
 
 def test_configured_screen_validation_rejects_unknown_transport() -> None:
@@ -108,9 +102,9 @@ def test_configured_screen_validation_rejects_unsupported_capability() -> None:
         ConfiguredScreen.from_dict(
             {
                 "id": "screen-4",
-                "name": "DLNA TV",
-                "transport": "dlna",
-                "capabilities": ["static_media", "live_view"],
+                "name": "LAN TV",
+                "transport": "browser",
+                "capabilities": ["static_media", "remote_input"],
             }
         )
 
@@ -143,9 +137,9 @@ def test_parse_configured_screens_skips_invalid_and_duplicate_entries() -> None:
             },
             {
                 "id": "screen-2",
-                "name": "Broken Miracast",
-                "transport": "miracast",
-                "capabilities": ["playlist"],
+                "name": "Broken Browser",
+                "transport": "browser",
+                "capabilities": ["remote_input"],
             },
             "not-a-dict",
         ]
