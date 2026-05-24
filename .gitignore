@@ -27,4 +27,4 @@ app_data/
 build/
 dist/
 installer-dist/
-ArchitectureReviewAndRemediationPlan.md
+docs/ARCHITECTURE_REVIEW_AND_REMEDIATION_PLAN.md
