@@ -19,6 +19,7 @@ env/
 
 # Local runtime / test data
 app_data/
+
 *.log
 *.zip
 
@@ -26,3 +27,4 @@ app_data/
 build/
 dist/
 installer-dist/
+ArchitectureReviewAndRemediationPlan.md

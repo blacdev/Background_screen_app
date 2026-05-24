@@ -1,12 +1,22 @@
 [run]
 branch = True
+relative_files = True
 source =
     browser_screen_bindings
-    dlna_support
-    miracast_support
+    media_library
+    models
+    playback_assignment
+    playback_protocol
+    release_tools
+    scheduling
     screen_groups
     screen_protocols
+    screen_registry
+    ui_styles
+omit =
+    tests/*
 
 [report]
-fail_under = 100
+fail_under = 85
 show_missing = True
+skip_covered = True

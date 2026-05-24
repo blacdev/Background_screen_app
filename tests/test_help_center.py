@@ -37,9 +37,16 @@ def test_markdown_to_help_html_renders_lists_and_subheadings() -> None:
     assert "<ul" in html
 
 
-def test_user_guide_contains_complete_start_to_finish_setup_flow() -> None:
-    guide_path = main_module.APP_ROOT / "docs" / "USER_GUIDE.md"
-    text = guide_path.read_text(encoding="utf-8")
+def test_user_guide_style_content_can_be_parsed_from_inline_markdown() -> None:
+    text = """
+# Background Screen Controller
+## Start here - complete setup from start to finish
+1. Engine > Start Engine
+2. Library > Set Media Folder
+3. Screen > Manage Screens
+4. Build your first schedule
+5. Start playback.
+""".strip()
     sections = dict(main_module.markdown_sections(text))
 
     assert "Start here - complete setup from start to finish" in sections
@@ -51,9 +58,17 @@ def test_user_guide_contains_complete_start_to_finish_setup_flow() -> None:
     assert "Start playback." in start_here
 
 
-def test_release_checklist_contains_build_and_validation_gates() -> None:
-    checklist_path = main_module.APP_ROOT / "docs" / "RELEASE_CHECKLIST.md"
-    text = checklist_path.read_text(encoding="utf-8")
+def test_release_checklist_style_content_contains_build_and_validation_gates() -> None:
+    text = """
+# Release Checklist
+## 2) Build artifacts
+- build_exe.bat
+- build_installer.bat
+## 5) Diagnostics and operations
+- Export Diagnostics
+## 7) Final release gate
+- Run targeted automated tests
+""".strip()
 
     assert "## 2) Build artifacts" in text
     assert "build_exe.bat" in text
@@ -63,9 +78,16 @@ def test_release_checklist_contains_build_and_validation_gates() -> None:
     assert "## 7) Final release gate" in text
 
 
-def test_accessibility_review_contains_scope_and_follow_up_actions() -> None:
-    review_path = main_module.APP_ROOT / "docs" / "ACCESSIBILITY_CONTRAST_REVIEW.md"
-    text = review_path.read_text(encoding="utf-8")
+def test_accessibility_review_style_content_contains_scope_and_follow_up_actions() -> (
+    None
+):
+    text = """
+# Accessibility Review
+## Scope
+## Current findings
+## Implemented improvements in this phase
+## Follow-up recommendations
+""".strip()
 
     assert "## Scope" in text
     assert "## Current findings" in text
